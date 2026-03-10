@@ -1,0 +1,17 @@
+[build-system]
+requires = ["hatchling"]
+build-backend = "hatchling.build"
+
+[project]
+name = "astridr-channels"
+version = "0.1.0"
+description = "Channel adapters and message router for the Astridr AI agent framework"
+requires-python = ">=3.11"
+dependencies = [
+    "python-telegram-bot",
+    "slack-bolt",
+    "aiosmtplib",
+    "fastapi",
+    "uvicorn",
+    "structlog",
+]
