@@ -120,20 +120,6 @@ class MessageRouter:
             await self._episodic.record(agent_id, event_type, summary, detail)
         except Exception:
             logger.debug("episodic.record_failed", event_type=event_type, exc_info=True)
-        # Mirror to Convex so CodePulse Memory Browser shows data
-        try:
-            await self._telemetry.send(
-                "episodic_event",
-                {
-                    "agentId": agent_id,
-                    "eventType": event_type,
-                    "summary": summary,
-                    "detail": detail,
-                    "occurredAt": time.time(),
-                },
-            )
-        except Exception:
-            logger.debug("episodic.telemetry_failed", event_type=event_type, exc_info=True)
 
     # -- Queue-aware send -----------------------------------------------------
 
