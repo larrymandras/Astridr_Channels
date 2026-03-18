@@ -23,6 +23,7 @@ from astridr.channels.base import (
     MessageHandler,
     OutgoingMessage,
 )
+from astridr.channels.briefing_dashboard import register_briefing_dashboard
 
 logger = structlog.get_logger()
 
@@ -71,7 +72,6 @@ class SSEManager:
 
 
 # ── HTML Chat Interface ──────────────────────────────────────────────
-
 
 CHAT_HTML = """<!DOCTYPE html>
 <html lang="en">
@@ -205,7 +205,7 @@ class WebChannel(BaseChannel):
         self._sse_manager = SSEManager()
         self._running = False
 
-    # ── Lifecycle ────────────────────────────────────────────────────────
+    # ── Lifecycle ────────────────────────────────────────────────
 
     async def start(self, on_message: MessageHandler) -> None:
         """Create the FastAPI app, mount routes, and start uvicorn."""
@@ -231,7 +231,7 @@ class WebChannel(BaseChannel):
             self._server.should_exit = True
             logger.info("web.stopped")
 
-    # ── Sending ──────────────────────────────────────────────────────────
+    # ── Sending ──────────────────────────────────────────────────
 
     async def send(self, message: OutgoingMessage) -> None:
         """Push a message to the SSE stream for the given chat_id."""
@@ -260,12 +260,14 @@ class WebChannel(BaseChannel):
         """Send a typing indicator via SSE."""
         await self._sse_manager.publish_typing(chat_id)
 
-    # ── Internal: app setup ──────────────────────────────────────────────
+    # ── Internal: app setup ──────────────────────────────────────
 
     def _setup_app(self) -> None:
         """Create the FastAPI application with routes and middleware."""
         self._app = FastAPI(title="Astridr Web Chat", docs_url=None, redoc_url=None)
         self._add_security_middleware()
+        # Dashboard routes must register BEFORE catch-all /{profile_path} routes
+        register_briefing_dashboard(self._app)
         self._register_routes()
 
     def _add_security_middleware(self) -> None:
@@ -396,7 +398,7 @@ class WebChannel(BaseChannel):
                 },
             )
 
-        # ── Profile-scoped routes ────────────────────────────────────────
+        # ── Profile-scoped routes ────────────────────────────────
 
         @app.post("/{profile_path}/api/chat")
         async def post_chat_profile(profile_path: str, request: Request) -> JSONResponse:
@@ -477,7 +479,7 @@ class WebChannel(BaseChannel):
                 f'"/{profile_path}/api/chat/" + chatId + "/stream"',
             ).replace(
                 "<h1>Astridr Chat</h1>",
-                f"<h1>Astridr Chat \u2014 {profile_path.title()}</h1>",
+                f"<h1>Astridr Chat — {profile_path.title()}</h1>",
             )
             return HTMLResponse(content=scoped_html)
 
