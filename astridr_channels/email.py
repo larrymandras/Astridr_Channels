@@ -62,6 +62,7 @@ class EmailChannel(BaseChannel):
         smtp_port: int = 587,
         filter_newsletters: bool = True,
         avatar_path: Path | None = None,
+        personal_avatar_path: Path | None = None,
     ) -> None:
         self._imap_host = imap_host
         self._smtp_host = smtp_host
@@ -72,6 +73,7 @@ class EmailChannel(BaseChannel):
         self._smtp_port = smtp_port
         self._filter_newsletters = filter_newsletters
         self._avatar_path = avatar_path
+        self._personal_avatar_path = personal_avatar_path
 
         self._imap_client: Any = None
         self._on_message: MessageHandler | None = None
@@ -82,7 +84,7 @@ class EmailChannel(BaseChannel):
         self._thread_map: dict[str, dict[str, str]] = {}
         # key = chat_id (sender email), value = {message_id, references}
 
-    # ── Lifecycle ────────────────────────────────────────────────────────
+    # ── Lifecycle ────────────────────────────────────────────────
 
     async def start(self, on_message: MessageHandler) -> None:
         """Connect to IMAP and begin the polling / IDLE loop."""
@@ -121,7 +123,7 @@ class EmailChannel(BaseChannel):
 
         logger.info("email.stopped")
 
-    # ── Sending ──────────────────────────────────────────────────────────
+    # ── Sending ──────────────────────────────────────────────────
 
     async def send(self, message: OutgoingMessage) -> None:
         """Send an email via SMTP, preserving reply threading."""
@@ -144,7 +146,7 @@ class EmailChannel(BaseChannel):
         """Email has no typing indicator — this is a no-op."""
         logger.debug("email.typing_noop", chat_id=chat_id)
 
-    # ── Internal: polling loop ───────────────────────────────────────────
+    # ── Internal: polling loop ───────────────────────────────────
 
     async def _poll_loop(self) -> None:
         """Poll IMAP for new messages.  Attempts IDLE first, falls back to interval polling."""
@@ -243,7 +245,7 @@ class EmailChannel(BaseChannel):
         except Exception:
             logger.debug("email.mark_seen_failed", uid=uid)
 
-    # ── Internal: email parsing ──────────────────────────────────────────
+    # ── Internal: email parsing ──────────────────────────────────
 
     def _parse_email(self, msg: EmailMessage, uid: str) -> IncomingMessage:
         """Convert a stdlib EmailMessage into an IncomingMessage."""
@@ -365,7 +367,7 @@ class EmailChannel(BaseChannel):
         _, addr = email_lib.utils.parseaddr(from_header)
         return addr or from_header
 
-    # ── Internal: email building ─────────────────────────────────────────
+    # ── Internal: email building ─────────────────────────────────
 
     _SIGNATURE_HTML = """\
 <br><br>
@@ -423,18 +425,32 @@ class EmailChannel(BaseChannel):
         )
         alt.attach(email_lib.mime.text.MIMEText(html_content, "html", "utf-8"))
 
-        # Wrap in multipart/related so the inline avatar is embedded, not attached
-        if self._avatar_path and self._avatar_path.exists():
-            import email.mime.image
+        # Wrap in multipart/related so inline avatars are embedded, not attached
+        import email.mime.image
 
+        inline_images: list[tuple[bytes, str, str, str]] = []  # (data, subtype, cid, filename)
+
+        if self._avatar_path and self._avatar_path.exists():
+            inline_images.append((
+                self._avatar_path.read_bytes(), "png", "astridr-avatar", "avatar.png",
+            ))
+
+        if self._personal_avatar_path and self._personal_avatar_path.exists():
+            suffix = self._personal_avatar_path.suffix.lower()
+            subtype = "jpeg" if suffix in (".jpg", ".jpeg") else "png"
+            inline_images.append((
+                self._personal_avatar_path.read_bytes(), subtype, "avatar", f"personal-avatar{suffix}",
+            ))
+
+        if inline_images:
             related = email_lib.mime.multipart.MIMEMultipart("related")
             related.attach(alt)
 
-            img_data = self._avatar_path.read_bytes()
-            img = email.mime.image.MIMEImage(img_data, _subtype="png")
-            img.add_header("Content-ID", "<astridr-avatar>")
-            img.add_header("Content-Disposition", "inline", filename="avatar.png")
-            related.attach(img)
+            for img_data, subtype, cid, filename in inline_images:
+                img_part = email.mime.image.MIMEImage(img_data, _subtype=subtype)
+                img_part.add_header("Content-ID", f"<{cid}>")
+                img_part.add_header("Content-Disposition", "inline", filename=filename)
+                related.attach(img_part)
 
             msg.attach(related)
         else:
@@ -458,7 +474,7 @@ class EmailChannel(BaseChannel):
         return msg
 
 
-# ── Utility: HTML → plain text ───────────────────────────────────────
+# ── Utility: HTML → plain text ───────────────────────────────────
 
 
 def html_to_text(raw_html: str) -> str:
