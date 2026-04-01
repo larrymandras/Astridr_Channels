@@ -31,7 +31,7 @@ from astridr.channels.briefing_dashboard import register_briefing_dashboard
 logger = structlog.get_logger()
 
 
-# ── SSE Manager ────────────────────────────────────────────────────────
+# ── SSE Manager ──────────────────────────────────────────────────────
 
 
 class SSEManager:
@@ -74,7 +74,7 @@ class SSEManager:
         await self.publish(chat_id, "typing", {"status": "typing"})
 
 
-# ── HTML Chat Interface ────────────────────────────────────────────────
+# ── HTML Chat Interface ──────────────────────────────────────────────
 
 CHAT_HTML = """<!DOCTYPE html>
 <html lang="en">
@@ -284,7 +284,7 @@ CHAT_HTML = """<!DOCTYPE html>
 </html>"""
 
 
-# ── WebChannel ─────────────────────────────────────────────────────────
+# ── WebChannel ───────────────────────────────────────────────────────
 
 
 class WebChannel(BaseChannel):
@@ -303,7 +303,7 @@ class WebChannel(BaseChannel):
         self._sse_manager = SSEManager()
         self._running = False
 
-    # ── Lifecycle ────────────────────────────────────────────────────────
+    # ── Lifecycle ────────────────────────────────────────────────
 
     async def start(self, on_message: MessageHandler) -> None:
         """Create the FastAPI app, mount routes, and start uvicorn."""
@@ -329,7 +329,7 @@ class WebChannel(BaseChannel):
             self._server.should_exit = True
             logger.info("web.stopped")
 
-    # ── Sending ──────────────────────────────────────────────────────────
+    # ── Sending ──────────────────────────────────────────────────
 
     async def send(self, message: OutgoingMessage) -> None:
         """Push a message to the SSE stream for the given chat_id."""
@@ -450,7 +450,7 @@ class WebChannel(BaseChannel):
             Path(tmp_in_path).unlink(missing_ok=True)
             Path(wav_path).unlink(missing_ok=True)
 
-    # ── Internal: app setup ──────────────────────────────────────────────
+    # ── Internal: app setup ──────────────────────────────────────
 
     def _setup_app(self) -> None:
         """Create the FastAPI application with routes and middleware."""
@@ -627,7 +627,7 @@ class WebChannel(BaseChannel):
                 },
             )
 
-        # ── Pipe management endpoints ───────────────────────────────────────
+        # ── Pipe management endpoints ───────────────────────────────
 
         @app.get("/api/pipes")
         async def list_pipes() -> JSONResponse:
@@ -700,7 +700,7 @@ class WebChannel(BaseChannel):
                 ],
             })
 
-        # ── Profile-scoped routes ────────────────────────────────────────────
+        # ── Profile-scoped routes ────────────────────────────────
 
         @app.post("/{profile_path}/api/chat")
         async def post_chat_profile(profile_path: str, request: Request) -> JSONResponse:
@@ -781,7 +781,7 @@ class WebChannel(BaseChannel):
                 f'"/{profile_path}/api/chat/" + chatId + "/stream"',
             ).replace(
                 "<h1>Astridr Chat</h1>",
-                f"<h1>Astridr Chat \u2014 {profile_path.title()}</h1>",
+                f"<h1>Astridr Chat — {profile_path.title()}</h1>",
             ).replace(
                 '"/api/chat/voice"',
                 f'"/{profile_path}/api/chat/voice"',

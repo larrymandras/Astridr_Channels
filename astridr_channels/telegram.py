@@ -44,7 +44,7 @@ class TelegramChannel(BaseChannel):
         self._running = False
         self._approval_callback = approval_callback
 
-    # ── Lifecycle ────────────────────────────────────────────────────────
+    # ── Lifecycle ────────────────────────────────────────────────
 
     async def start(self, on_message: MessageHandler) -> None:
         """Build the Telegram Application, register handlers, and start polling."""
@@ -99,7 +99,7 @@ class TelegramChannel(BaseChannel):
             await self._application.shutdown()
             logger.info("telegram.stopped")
 
-    # ── Sending ──────────────────────────────────────────────────────────
+    # ── Sending ──────────────────────────────────────────────────
 
     async def send(self, message: OutgoingMessage) -> None:
         """Send a message to Telegram, splitting if necessary and adding buttons."""
@@ -149,7 +149,7 @@ class TelegramChannel(BaseChannel):
             action=ChatAction.TYPING,
         )
 
-    # ── Internal: update handling ────────────────────────────────────────
+    # ── Internal: update handling ────────────────────────────────
 
     async def _handle_update(self, update: Any, context: Any) -> None:  # noqa: ARG002
         """Process an incoming Telegram update."""
@@ -249,12 +249,12 @@ class TelegramChannel(BaseChannel):
                 return result.output
 
             logger.warning("telegram.voice_transcription_failed", error=result.error)
-            return "[Voice message \u2014 transcription unavailable]"
+            return "[Voice message — transcription unavailable]"
         except Exception as exc:
             logger.warning("telegram.voice_transcription_error", error=str(exc))
-            return "[Voice message \u2014 transcription unavailable]"
+            return "[Voice message — transcription unavailable]"
 
-    # ── Internal: attachment helpers ───────────────────────────────────────
+    # ── Internal: attachment helpers ─────────────────────────────
 
     @staticmethod
     def _extract_attachments(message: Any) -> list[Attachment]:
@@ -340,7 +340,7 @@ class TelegramChannel(BaseChannel):
         return InlineKeyboardMarkup(keyboard)
 
 
-# ── Utility: message splitting ───────────────────────────────────────
+# ── Utility: message splitting ───────────────────────────────────
 
 
 def split_message(text: str, max_length: int = TELEGRAM_MAX_LENGTH) -> list[str]:

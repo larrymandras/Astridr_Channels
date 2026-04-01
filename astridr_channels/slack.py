@@ -35,7 +35,7 @@ class SlackChannel(BaseChannel):
         self._on_message: MessageHandler | None = None
         self._running = False
 
-    # ── Lifecycle ────────────────────────────────────────────────────────
+    # ── Lifecycle ────────────────────────────────────────────────
 
     async def start(self, on_message: MessageHandler) -> None:
         """Register Slack event handlers and start async Socket Mode."""
@@ -66,7 +66,7 @@ class SlackChannel(BaseChannel):
             await self._socket_handler.close_async()
             logger.info("slack.stopped")
 
-    # ── Sending ──────────────────────────────────────────────────────────
+    # ── Sending ──────────────────────────────────────────────────
 
     async def send(self, message: OutgoingMessage) -> None:
         """Post a message to Slack with optional Block Kit formatting and buttons."""
@@ -116,7 +116,7 @@ class SlackChannel(BaseChannel):
         # We log the intent; callers can use this as a hook for a "thinking" message.
         logger.debug("slack.typing", chat_id=chat_id)
 
-    # ── Internal: handler registration ───────────────────────────────────
+    # ── Internal: handler registration ───────────────────────────
 
     def _register_handlers(self) -> None:
         """Wire up Slack event listeners on the bolt app."""
@@ -173,7 +173,7 @@ class SlackChannel(BaseChannel):
 
         await self._on_message(incoming)
 
-    # ── Internal: attachments ────────────────────────────────────────────
+    # ── Internal: attachments ────────────────────────────────────
 
     def _extract_attachments(self, event: dict[str, Any]) -> list[Attachment]:
         """Pull file metadata from a Slack message event."""
@@ -213,7 +213,7 @@ class SlackChannel(BaseChannel):
         if "content" in kwargs or "file" in kwargs:
             await self._app.client.files_upload_v2(**kwargs)
 
-    # ── Internal: Block Kit ──────────────────────────────────────────────
+    # ── Internal: Block Kit ──────────────────────────────────────
 
     def _build_blocks(self, message: OutgoingMessage) -> list[dict[str, Any]]:
         """Build Slack Block Kit blocks from an OutgoingMessage."""

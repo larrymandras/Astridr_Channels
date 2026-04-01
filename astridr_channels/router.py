@@ -645,8 +645,8 @@ class MessageRouter:
             lines = ["**Available Profiles:**"]
             for p in profiles:
                 marker = " (active)" if p.id == self._get_active_profile_id(session) else ""
-                desc = f" \u2014 {p.soul_override}" if p.soul_override else ""
-                lines.append(f"  \u2022 `{p.id}` \u2014 {p.name}{desc}{marker}")
+                desc = f" — {p.soul_override}" if p.soul_override else ""
+                lines.append(f"  • `{p.id}` — {p.name}{desc}{marker}")
             return "\n".join(lines)
 
         elif sub_cmd == "use":
@@ -681,9 +681,9 @@ class MessageRouter:
         else:
             return (
                 "Unknown sub-command. Usage:\n"
-                "  `/profile list` \u2014 show profiles\n"
-                "  `/profile use <id>` \u2014 switch profile\n"
-                "  `/profile current` \u2014 show active profile"
+                "  `/profile list` — show profiles\n"
+                "  `/profile use <id>` — switch profile\n"
+                "  `/profile current` — show active profile"
             )
 
     def _apply_profile_to_session(self, session: Session, agent_profile: Any) -> None:
