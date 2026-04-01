@@ -31,14 +31,20 @@ class TelegramChannel(BaseChannel):
 
     channel_id: str = "telegram"
 
-    def __init__(self, token: str, allowed_user_ids: list[int] | None = None) -> None:
+    def __init__(
+        self,
+        token: str,
+        allowed_user_ids: list[int] | None = None,
+        approval_callback: Any = None,  # Callable[[str, str], Awaitable[None]] | None
+    ) -> None:
         self._token = token
         self._allowed_user_ids: set[int] = set(allowed_user_ids or [])
         self._application: Any = None
         self._on_message: MessageHandler | None = None
         self._running = False
+        self._approval_callback = approval_callback
 
-    # ── Lifecycle ────────────────────────────────────────────────
+    # ── Lifecycle ────────────────────────────────────────────────────────
 
     async def start(self, on_message: MessageHandler) -> None:
         """Build the Telegram Application, register handlers, and start polling."""
@@ -65,6 +71,15 @@ class TelegramChannel(BaseChannel):
             )
         )
 
+        from telegram.ext import CallbackQueryHandler
+
+        self._application.add_handler(
+            CallbackQueryHandler(
+                self._handle_callback_query,
+                pattern=r"^agent_(approve|reject):",
+            )
+        )
+
         self._running = True
         logger.info("telegram.starting")
 
@@ -84,7 +99,7 @@ class TelegramChannel(BaseChannel):
             await self._application.shutdown()
             logger.info("telegram.stopped")
 
-    # ── Sending ──────────────────────────────────────────────────
+    # ── Sending ──────────────────────────────────────────────────────────
 
     async def send(self, message: OutgoingMessage) -> None:
         """Send a message to Telegram, splitting if necessary and adding buttons."""
@@ -134,7 +149,7 @@ class TelegramChannel(BaseChannel):
             action=ChatAction.TYPING,
         )
 
-    # ── Internal: update handling ────────────────────────────────
+    # ── Internal: update handling ────────────────────────────────────────
 
     async def _handle_update(self, update: Any, context: Any) -> None:  # noqa: ARG002
         """Process an incoming Telegram update."""
@@ -174,6 +189,36 @@ class TelegramChannel(BaseChannel):
 
         await self._on_message(incoming)
 
+    async def _handle_callback_query(self, update: Any, context: Any) -> None:  # noqa: ARG002
+        """Handle Approve/Reject button presses for agent approval gate."""
+        query = update.callback_query
+        # MUST answer immediately to dismiss Telegram loading spinner
+        await query.answer()
+
+        data = query.data  # e.g. "agent_approve:uuid-here"
+        if ":" not in data:
+            logger.warning("telegram.invalid_callback_data", data=data)
+            return
+
+        action, approval_id = data.split(":", 1)
+
+        if self._approval_callback:
+            try:
+                await self._approval_callback(action, approval_id)
+                # Edit the message to show decision result
+                decision = "Approved" if "approve" in action else "Rejected"
+                await query.edit_message_text(
+                    text=f"{query.message.text}\n\n--- {decision} ---"
+                )
+            except Exception as exc:
+                logger.error(
+                    "telegram.approval_callback_error",
+                    approval_id=approval_id,
+                    error=str(exc),
+                )
+        else:
+            logger.warning("telegram.no_approval_callback", approval_id=approval_id)
+
     async def _transcribe_voice(self, message: Any) -> str:
         """Download a voice/audio message from Telegram and transcribe it."""
         try:
@@ -204,12 +249,12 @@ class TelegramChannel(BaseChannel):
                 return result.output
 
             logger.warning("telegram.voice_transcription_failed", error=result.error)
-            return "[Voice message — transcription unavailable]"
+            return "[Voice message \u2014 transcription unavailable]"
         except Exception as exc:
             logger.warning("telegram.voice_transcription_error", error=str(exc))
-            return "[Voice message — transcription unavailable]"
+            return "[Voice message \u2014 transcription unavailable]"
 
-    # ── Internal: attachment helpers ─────────────────────────────
+    # ── Internal: attachment helpers ───────────────────────────────────────
 
     @staticmethod
     def _extract_attachments(message: Any) -> list[Attachment]:
@@ -295,7 +340,7 @@ class TelegramChannel(BaseChannel):
         return InlineKeyboardMarkup(keyboard)
 
 
-# ── Utility: message splitting ───────────────────────────────────
+# ── Utility: message splitting ───────────────────────────────────────
 
 
 def split_message(text: str, max_length: int = TELEGRAM_MAX_LENGTH) -> list[str]:

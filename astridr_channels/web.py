@@ -9,13 +9,16 @@ from __future__ import annotations
 
 import asyncio
 import json
+import tempfile
 import time
+import uuid
+from pathlib import Path
 from typing import Any
 
 import structlog
 import uvicorn
-from fastapi import FastAPI, Request
-from fastapi.responses import HTMLResponse, JSONResponse, StreamingResponse
+from fastapi import FastAPI, Form, Request, UploadFile
+from fastapi.responses import FileResponse, HTMLResponse, JSONResponse, StreamingResponse
 
 from astridr.channels.base import (
     BaseChannel,
@@ -28,7 +31,7 @@ from astridr.channels.briefing_dashboard import register_briefing_dashboard
 logger = structlog.get_logger()
 
 
-# ── SSE Manager ──────────────────────────────────────────────────────
+# ── SSE Manager ────────────────────────────────────────────────────────
 
 
 class SSEManager:
@@ -71,7 +74,7 @@ class SSEManager:
         await self.publish(chat_id, "typing", {"status": "typing"})
 
 
-# ── HTML Chat Interface ──────────────────────────────────────────────
+# ── HTML Chat Interface ────────────────────────────────────────────────
 
 CHAT_HTML = """<!DOCTYPE html>
 <html lang="en">
@@ -116,6 +119,29 @@ CHAT_HTML = """<!DOCTYPE html>
     font-size: 0.95rem; font-weight: 600;
   }
   #input-area button:hover { background: #c73650; }
+#mic-btn {
+  padding: 10px 16px; border: none; border-radius: 8px;
+  background: #0f3460; color: #e0e0e0; cursor: pointer;
+  font-size: 0.95rem; font-weight: 600; transition: background 0.2s;
+}
+#mic-btn:hover { background: #1a4a8a; }
+#mic-btn.recording { background: #e94560; color: #fff; }
+#mic-btn:disabled { opacity: 0.5; cursor: not-allowed; }
+.waveform {
+  display: none; align-items: center; gap: 3px; height: 20px;
+}
+.waveform.active { display: flex; }
+.waveform span {
+  display: block; width: 3px; background: #e94560; border-radius: 2px;
+  animation: wave 0.8s ease-in-out infinite;
+}
+.waveform span:nth-child(2) { animation-delay: 0.15s; }
+.waveform span:nth-child(3) { animation-delay: 0.3s; }
+.waveform span:nth-child(4) { animation-delay: 0.45s; }
+@keyframes wave {
+  0%, 100% { height: 6px; }
+  50% { height: 18px; }
+}
 </style>
 </head>
 <body>
@@ -123,6 +149,8 @@ CHAT_HTML = """<!DOCTYPE html>
 <div id="messages"></div>
 <div id="input-area">
   <input id="msg-input" type="text" placeholder="Type a message..." autocomplete="off" />
+  <button id="mic-btn" title="Voice recording">Mic</button>
+  <div class="waveform" id="waveform"><span></span><span></span><span></span><span></span></div>
   <button id="send-btn">Send</button>
 </div>
 <script>
@@ -159,6 +187,10 @@ CHAT_HTML = """<!DOCTYPE html>
     hideTyping();
     const d = JSON.parse(e.data);
     if (d.text) addMsg(d.text, "bot");
+    if (d.audio_url) {
+      var audio = new Audio(d.audio_url);
+      audio.play().catch(function(err) { console.warn("Audio playback failed:", err); });
+    }
   });
   es.addEventListener("typing", function(e) { showTyping(); });
   es.onerror = function() { console.warn("SSE connection lost, retrying..."); };
@@ -181,13 +213,78 @@ CHAT_HTML = """<!DOCTYPE html>
   input.addEventListener("keydown", function(e) {
     if (e.key === "Enter") send();
   });
+
+  // ── Voice Recording (D-01, D-02, D-14) ──
+  const micBtn = document.getElementById("mic-btn");
+  const waveformEl = document.getElementById("waveform");
+  let mediaRecorder = null;
+  let audioChunks = [];
+  let isRecording = false;
+
+  function setRecordingState(recording) {
+    isRecording = recording;
+    micBtn.classList.toggle("recording", recording);
+    micBtn.textContent = recording ? "Stop" : "Mic";
+    waveformEl.classList.toggle("active", recording);
+  }
+
+  micBtn.addEventListener("click", async function() {
+    if (!isRecording) {
+      try {
+        const stream = await navigator.mediaDevices.getUserMedia({ audio: true });
+        const mimeType = MediaRecorder.isTypeSupported("audio/webm;codecs=opus")
+          ? "audio/webm;codecs=opus"
+          : "audio/ogg;codecs=opus";
+        mediaRecorder = new MediaRecorder(stream, { mimeType: mimeType });
+        audioChunks = [];
+
+        mediaRecorder.ondataavailable = function(e) {
+          if (e.data.size > 0) audioChunks.push(e.data);
+        };
+
+        mediaRecorder.onstop = async function() {
+          stream.getTracks().forEach(function(t) { t.stop(); });
+          const blob = new Blob(audioChunks, { type: "audio/webm" });
+          const form = new FormData();
+          form.append("chat_id", chatId);
+          form.append("sender_id", senderId);
+          form.append("audio", blob, "recording.webm");
+
+          micBtn.disabled = true;
+          try {
+            const resp = await fetch("/api/chat/voice", { method: "POST", body: form });
+            if (resp.ok) {
+              const data = await resp.json();
+              if (data.transcript) addMsg(data.transcript, "user");
+            } else {
+              console.error("Voice upload failed:", resp.status);
+            }
+          } catch(err) {
+            console.error("Voice upload error:", err);
+          } finally {
+            micBtn.disabled = false;
+          }
+        };
+
+        mediaRecorder.start();
+        setRecordingState(true);
+      } catch(err) {
+        console.error("Microphone access denied:", err);
+      }
+    } else {
+      if (mediaRecorder && mediaRecorder.state !== "inactive") {
+        mediaRecorder.stop();
+      }
+      setRecordingState(false);
+    }
+  });
 })();
 </script>
 </body>
 </html>"""
 
 
-# ── WebChannel ───────────────────────────────────────────────────────
+# ── WebChannel ─────────────────────────────────────────────────────────
 
 
 class WebChannel(BaseChannel):
@@ -195,17 +292,18 @@ class WebChannel(BaseChannel):
 
     channel_id: str = "web"
 
-    def __init__(self, host: str = "0.0.0.0", port: int = 8080, api_key: str | None = None) -> None:
+    def __init__(self, host: str = "0.0.0.0", port: int = 8080, api_key: str | None = None, pipe_manager: Any | None = None) -> None:
         self._host = host
         self._port = port
         self._api_key = api_key
+        self._pipe_manager = pipe_manager
         self._app: FastAPI | None = None
         self._server: Any = None
         self._on_message: MessageHandler | None = None
         self._sse_manager = SSEManager()
         self._running = False
 
-    # ── Lifecycle ────────────────────────────────────────────────
+    # ── Lifecycle ────────────────────────────────────────────────────────
 
     async def start(self, on_message: MessageHandler) -> None:
         """Create the FastAPI app, mount routes, and start uvicorn."""
@@ -231,7 +329,7 @@ class WebChannel(BaseChannel):
             self._server.should_exit = True
             logger.info("web.stopped")
 
-    # ── Sending ──────────────────────────────────────────────────
+    # ── Sending ──────────────────────────────────────────────────────────
 
     async def send(self, message: OutgoingMessage) -> None:
         """Push a message to the SSE stream for the given chat_id."""
@@ -252,6 +350,12 @@ class WebChannel(BaseChannel):
                 }
                 for a in message.attachments
             ]
+            # Include audio_url for voice replies (D-12)
+            for att in message.attachments:
+                if att.mime_type == "audio/mpeg" and att.file_path:
+                    audio_name = Path(att.file_path).name
+                    data["audio_url"] = f"/api/audio/{audio_name}"
+                    break
 
         await self._sse_manager.publish(message.chat_id, "message", data)
         logger.debug("web.sent", chat_id=message.chat_id)
@@ -260,7 +364,93 @@ class WebChannel(BaseChannel):
         """Send a typing indicator via SSE."""
         await self._sse_manager.publish_typing(chat_id)
 
-    # ── Internal: app setup ──────────────────────────────────────
+    async def _ffmpeg_transcode(self, input_path: str, output_path: str) -> bool:
+        """Transcode audio to 16kHz mono WAV for Whisper. Returns True on success."""
+        try:
+            proc = await asyncio.create_subprocess_exec(
+                "ffmpeg", "-y",
+                "-i", input_path,
+                "-ar", "16000",
+                "-ac", "1",
+                "-f", "wav",
+                output_path,
+                stdout=asyncio.subprocess.DEVNULL,
+                stderr=asyncio.subprocess.PIPE,
+            )
+            _, stderr = await asyncio.wait_for(proc.communicate(), timeout=30.0)
+            if proc.returncode != 0:
+                logger.warning(
+                    "web.voice_transcode_failed",
+                    returncode=proc.returncode,
+                    stderr=stderr.decode()[:500] if stderr else "",
+                )
+                return False
+            return True
+        except asyncio.TimeoutError:
+            logger.warning("web.voice_transcode_timeout", input_path=input_path)
+            return False
+        except FileNotFoundError:
+            logger.error("web.ffmpeg_not_found")
+            return False
+
+    async def _process_voice_upload(
+        self, chat_id: str, sender_id: str, audio: UploadFile
+    ) -> JSONResponse:
+        """Shared voice upload handler used by root and profile-scoped voice routes."""
+        if not chat_id or not sender_id:
+            return JSONResponse(
+                status_code=422,
+                content={"detail": "Missing required fields: chat_id, sender_id"},
+            )
+
+        suffix = Path(audio.filename or "audio.webm").suffix or ".webm"
+        tmp_in = tempfile.NamedTemporaryFile(suffix=suffix, delete=False)
+        tmp_in_path = tmp_in.name
+        wav_path = tmp_in_path + ".wav"
+        try:
+            content = await audio.read()
+            tmp_in.write(content)
+            tmp_in.close()
+
+            ok = await self._ffmpeg_transcode(tmp_in_path, wav_path)
+            if not ok:
+                return JSONResponse(
+                    status_code=422, content={"detail": "Audio transcode failed"}
+                )
+
+            from astridr.media.whisper import WhisperTranscriber
+
+            transcriber = WhisperTranscriber()
+            result = await transcriber.execute(audio_path=wav_path)
+            transcript = result.output if result.success and result.output else ""
+            if not transcript:
+                return JSONResponse(
+                    status_code=422, content={"detail": "Transcription failed"}
+                )
+
+            incoming = IncomingMessage(
+                text=transcript,
+                sender_id=sender_id,
+                chat_id=chat_id,
+                channel_id=self.channel_id,
+                timestamp=time.time(),
+                reply_to_message_id=None,
+                attachments=[],
+                raw={"source": "voice"},
+            )
+            if self._on_message is not None:
+                asyncio.create_task(self._on_message(incoming))
+
+            logger.info("web.voice_transcribed", chat_id=chat_id, chars=len(transcript))
+            return JSONResponse(
+                status_code=200,
+                content={"status": "ok", "transcript": transcript, "chat_id": chat_id},
+            )
+        finally:
+            Path(tmp_in_path).unlink(missing_ok=True)
+            Path(wav_path).unlink(missing_ok=True)
+
+    # ── Internal: app setup ──────────────────────────────────────────────
 
     def _setup_app(self) -> None:
         """Create the FastAPI application with routes and middleware."""
@@ -321,6 +511,7 @@ class WebChannel(BaseChannel):
                 "style-src 'self' 'unsafe-inline'; "
                 "connect-src 'self'; "
                 "img-src 'self' data: blob:; "
+                "media-src 'self' blob:; "
                 "font-src 'self'"
             )
             return response
@@ -371,6 +562,44 @@ class WebChannel(BaseChannel):
                 content={"status": "ok", "chat_id": chat_id},
             )
 
+        @app.post("/api/chat/voice")
+        async def post_voice(
+            chat_id: str = Form(...),
+            sender_id: str = Form(...),
+            audio: UploadFile = Form(...),
+        ) -> JSONResponse:
+            """Accept voice audio, transcode, transcribe, dispatch as text message."""
+            return await self._process_voice_upload(chat_id, sender_id, audio)
+
+        @app.post("/{profile_path}/api/chat/voice")
+        async def post_voice_profile(
+            profile_path: str,
+            chat_id: str = Form(...),
+            sender_id: str = Form(...),
+            audio: UploadFile = Form(...),
+        ) -> JSONResponse:
+            """Accept voice audio scoped to a profile path."""
+            scoped_chat_id = f"/{profile_path}:{chat_id}"
+            return await self._process_voice_upload(scoped_chat_id, sender_id, audio)
+
+        @app.get("/api/audio/{filename}")
+        async def get_audio(filename: str) -> Any:
+            """Serve a TTS audio file by filename with path traversal protection."""
+            safe_name = Path(filename).name
+            audio_path = Path.home() / ".astridr" / "media" / "tts" / safe_name
+            if not audio_path.exists() or not audio_path.is_file():
+                return JSONResponse(status_code=404, content={"detail": "Audio not found"})
+            return FileResponse(str(audio_path), media_type="audio/mpeg")
+
+        @app.get("/{profile_path}/api/audio/{filename}")
+        async def get_audio_profile(profile_path: str, filename: str) -> Any:
+            """Serve a TTS audio file scoped to a profile path."""
+            safe_name = Path(filename).name
+            audio_path = Path.home() / ".astridr" / "media" / "tts" / safe_name
+            if not audio_path.exists() or not audio_path.is_file():
+                return JSONResponse(status_code=404, content={"detail": "Audio not found"})
+            return FileResponse(str(audio_path), media_type="audio/mpeg")
+
         @app.get("/api/chat/{chat_id}/stream")
         async def sse_stream(chat_id: str) -> StreamingResponse:
             """SSE endpoint — yields events as ``data: {json}\\n\\n``."""
@@ -398,7 +627,80 @@ class WebChannel(BaseChannel):
                 },
             )
 
-        # ── Profile-scoped routes ────────────────────────────────
+        # ── Pipe management endpoints ───────────────────────────────────────
+
+        @app.get("/api/pipes")
+        async def list_pipes() -> JSONResponse:
+            if self._pipe_manager is None:
+                return JSONResponse(status_code=501, content={"detail": "Pipes not configured"})
+            pipes = [
+                {
+                    "name": p.name,
+                    "schedule": p.schedule,
+                    "persona": p.persona,
+                    "profile": p.profile,
+                    "channel": p.channel,
+                    "enabled": p.enabled,
+                    "tags": p.tags,
+                }
+                for p in self._pipe_manager.pipes.values()
+            ]
+            return JSONResponse(content={"pipes": pipes})
+
+        @app.get("/api/pipes/{name}")
+        async def get_pipe(name: str) -> JSONResponse:
+            if self._pipe_manager is None:
+                return JSONResponse(status_code=501, content={"detail": "Pipes not configured"})
+            pipe = self._pipe_manager.pipes.get(name)
+            if pipe is None:
+                return JSONResponse(status_code=404, content={"detail": f"Pipe '{name}' not found"})
+            return JSONResponse(content={
+                "name": pipe.name,
+                "schedule": pipe.schedule,
+                "persona": pipe.persona,
+                "profile": pipe.profile,
+                "channel": pipe.channel,
+                "chat_id": pipe.chat_id,
+                "tools": pipe.tools,
+                "timeout_seconds": pipe.timeout_seconds,
+                "enabled": pipe.enabled,
+                "tags": pipe.tags,
+            })
+
+        @app.post("/api/pipes/{name}/run")
+        async def run_pipe(name: str) -> JSONResponse:
+            if self._pipe_manager is None:
+                return JSONResponse(status_code=501, content={"detail": "Pipes not configured"})
+            if name not in self._pipe_manager.pipes:
+                return JSONResponse(status_code=404, content={"detail": f"Pipe '{name}' not found"})
+            task = asyncio.create_task(self._pipe_manager.execute(name, trigger="manual"))
+            task.add_done_callback(lambda t: t.exception() if not t.cancelled() else None)
+            return JSONResponse(content={"status": "triggered", "pipe": name})
+
+        @app.get("/api/pipes/{name}/executions")
+        async def pipe_executions(name: str) -> JSONResponse:
+            if self._pipe_manager is None:
+                return JSONResponse(status_code=501, content={"detail": "Pipes not configured"})
+            if name not in self._pipe_manager.pipes:
+                return JSONResponse(status_code=404, content={"detail": f"Pipe '{name}' not found"})
+            jobs = await self._pipe_manager.get_executions(name)
+            return JSONResponse(content={
+                "pipe": name,
+                "executions": [
+                    {
+                        "id": j.id,
+                        "status": j.status,
+                        "trigger": j.trigger,
+                        "created_at": j.created_at,
+                        "started_at": j.started_at,
+                        "completed_at": j.completed_at,
+                        "error": j.error,
+                    }
+                    for j in jobs
+                ],
+            })
+
+        # ── Profile-scoped routes ────────────────────────────────────────────
 
         @app.post("/{profile_path}/api/chat")
         async def post_chat_profile(profile_path: str, request: Request) -> JSONResponse:
@@ -479,7 +781,13 @@ class WebChannel(BaseChannel):
                 f'"/{profile_path}/api/chat/" + chatId + "/stream"',
             ).replace(
                 "<h1>Astridr Chat</h1>",
-                f"<h1>Astridr Chat — {profile_path.title()}</h1>",
+                f"<h1>Astridr Chat \u2014 {profile_path.title()}</h1>",
+            ).replace(
+                '"/api/chat/voice"',
+                f'"/{profile_path}/api/chat/voice"',
+            ).replace(
+                '"/api/audio/',
+                f'"/{profile_path}/api/audio/',
             )
             return HTMLResponse(content=scoped_html)
 

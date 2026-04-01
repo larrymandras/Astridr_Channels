@@ -16,14 +16,18 @@ from typing import Any
 
 import structlog
 
+from astridr.core.secrets import get_snapshot
+
 from astridr.channels.base import (
     Attachment,
     BaseChannel,
     IncomingMessage,
     OutgoingMessage,
 )
-from astridr.engine.config import ProfileConfig
+from astridr.engine.config import PersonaConfig, ProfileConfig
+from astridr.engine.voice_identity import VoiceIdentityResolver
 from astridr.engine.telemetry import ConvexHandler
+from astridr.memory.recent_cache import RecentContextCache
 
 # Optional import — profiles module may not be available yet during early bootstrap
 try:
@@ -69,6 +73,7 @@ class MessageRouter:
         agent_loop: Any | None = None,
         security_pipeline: Any | None = None,
         emergency_stop: bool = False,
+        personas: list[PersonaConfig] | None = None,
         persistence: Any | None = None,
         profile_manager: Any | None = None,
         system_prompt_builder: Any | None = None,
@@ -97,6 +102,9 @@ class MessageRouter:
         if self._security_pipeline is None:
             self._try_load_security_fallback()
 
+        # Voice identity resolver (constructed once from persona config)
+        self._voice_resolver = VoiceIdentityResolver(personas or [])
+
         # TTS tool (lazy-initialized on first use)
         self._tts_tool: Any | None = None
 
@@ -108,6 +116,9 @@ class MessageRouter:
         # Offline mode: queue + connectivity monitor
         self._message_queue = message_queue
         self._connectivity_monitor = connectivity_monitor
+
+        # Hot cache for recent conversation context (Pattern 6)
+        self._recent_cache = RecentContextCache()
 
     # -- Episodic helpers ------------------------------------------------------
 
@@ -183,7 +194,8 @@ class MessageRouter:
         # 2. Resolve profile
         try:
             profile = self.resolve_profile(
-                message.sender_id, channel, chat_id=message.chat_id
+                message.sender_id, channel, chat_id=message.chat_id,
+                raw=message.raw,
             )
         except ValueError:
             logger.warning(
@@ -203,6 +215,9 @@ class MessageRouter:
                 "timestamp": message.timestamp,
             }
         )
+
+        # Populate hot cache with user message
+        self._recent_cache.append(session.id, "user", message.text)
 
         # 4. Security pipeline (inbound)
         inbound_text = message.text
@@ -227,6 +242,7 @@ class MessageRouter:
             session.messages.append(
                 {"role": "assistant", "content": response_text, "timestamp": time.time()}
             )
+            self._recent_cache.append(session.id, "assistant", response_text)
             outgoing = OutgoingMessage(
                 text=response_text,
                 chat_id=message.chat_id,
@@ -244,6 +260,9 @@ class MessageRouter:
                 "timestamp": time.time(),
             }
         )
+
+        # Populate hot cache with assistant response
+        self._recent_cache.append(session.id, "assistant", response_text)
 
         # 6. Security pipeline (outbound)
         final_text = response_text
@@ -264,8 +283,28 @@ class MessageRouter:
 
         # 7. TTS generation (if enabled on the profile)
         tts_attachments: list[Attachment] = []
+        voice_meta: dict[str, Any] = {}
+
         if profile.tts_enabled:
-            tts_attachment = await self._generate_tts(final_text)
+            persona_id = getattr(profile, "persona_id", None)
+
+            # Resolve voice identity for metadata — voice and web channels (per RESEARCH.md Pattern 3 / Phase 4)
+            if channel.channel_id in ("voice", "web"):
+                try:
+                    voice_id, stability, similarity_boost = self._voice_resolver.resolve(persona_id)
+                    voice_meta = {
+                        "voice_id": voice_id,
+                        "stability": stability,
+                        "similarity_boost": similarity_boost,
+                    }
+                except Exception:
+                    logger.warning("router.voice_resolve_failed", persona_id=persona_id)
+
+            # Generate file-based TTS attachment (batch path for Telegram, Web — per D-08/STTS-04)
+            tts_attachment = await self._generate_tts(
+                final_text,
+                persona_id=persona_id,
+            )
             if tts_attachment is not None:
                 tts_attachments.append(tts_attachment)
 
@@ -275,6 +314,7 @@ class MessageRouter:
             chat_id=message.chat_id,
             reply_to_message_id=message.reply_to_message_id,
             attachments=tts_attachments,
+            metadata=voice_meta,
         )
 
         await self._send_or_queue(channel, outgoing)
@@ -302,15 +342,23 @@ class MessageRouter:
         )
 
     def resolve_profile(
-        self, sender_id: str, channel: BaseChannel, *, chat_id: str = ""
+        self, sender_id: str, channel: BaseChannel, *, chat_id: str = "",
+        raw: dict[str, Any] | None = None,
     ) -> ProfileConfig:
         """Map a sender + channel + chat_id to a ProfileConfig.
 
-        Resolution order (3-tier):
+        Resolution order (4-tier):
+          0. raw.profile_id — explicit override (e.g. from pipe execution)
           1. channel_mappings — exact match of (channel_type, chat_id)
           2. default_for — fallback profile for unmapped traffic on this channel
           3. channels — broad channel-type match (backward compat)
         """
+        # Tier 0: explicit profile_id override (e.g. from pipe execution)
+        if raw and "profile_id" in raw:
+            override = self._profiles.get(raw["profile_id"])
+            if override is not None:
+                return override
+
         channel_type = channel.channel_id
 
         # Tier 1: channel_mappings — exact chat_id match
@@ -597,8 +645,8 @@ class MessageRouter:
             lines = ["**Available Profiles:**"]
             for p in profiles:
                 marker = " (active)" if p.id == self._get_active_profile_id(session) else ""
-                desc = f" — {p.soul_override}" if p.soul_override else ""
-                lines.append(f"  • `{p.id}` — {p.name}{desc}{marker}")
+                desc = f" \u2014 {p.soul_override}" if p.soul_override else ""
+                lines.append(f"  \u2022 `{p.id}` \u2014 {p.name}{desc}{marker}")
             return "\n".join(lines)
 
         elif sub_cmd == "use":
@@ -633,9 +681,9 @@ class MessageRouter:
         else:
             return (
                 "Unknown sub-command. Usage:\n"
-                "  `/profile list` — show profiles\n"
-                "  `/profile use <id>` — switch profile\n"
-                "  `/profile current` — show active profile"
+                "  `/profile list` \u2014 show profiles\n"
+                "  `/profile use <id>` \u2014 switch profile\n"
+                "  `/profile current` \u2014 show active profile"
             )
 
     def _apply_profile_to_session(self, session: Session, agent_profile: Any) -> None:
@@ -675,21 +723,29 @@ class MessageRouter:
                 logger.debug("router.tts_tool_not_available")
         return self._tts_tool
 
-    async def _generate_tts(self, text: str) -> Attachment | None:
+    async def _generate_tts(self, text: str, persona_id: str | None = None) -> Attachment | None:
         """Generate a TTS voice note for *text*.
 
         Returns an ``Attachment`` on success, or ``None`` if TTS is
         unavailable or the generation fails (non-blocking).
+
+        Args:
+            text: The text to convert to speech.
+            persona_id: Optional persona ID to resolve voice config from.
+                Falls back to ELEVENLABS_VOICE_ID env var when None or unknown.
         """
         tool = self._get_tts_tool()
         if tool is None:
             return None
 
         try:
-            import os
-
-            voice_id = os.environ.get("ELEVENLABS_VOICE_ID", "default")
-            result = await tool.execute(text=text, voice_id=voice_id)
+            voice_id, stability, similarity_boost = self._voice_resolver.resolve(persona_id)
+            result = await tool.execute(
+                text=text,
+                voice_id=voice_id,
+                stability=stability,
+                similarity_boost=similarity_boost,
+            )
             if result.success and result.data and result.data.get("path"):
                 return Attachment(
                     file_path=result.data["path"],

@@ -3,12 +3,12 @@
 from __future__ import annotations
 
 import asyncio
-import struct
 import time
 import uuid
 from pathlib import Path
 from typing import Any
 
+import numpy as np
 import structlog
 
 from astridr.channels.base import (
@@ -17,7 +17,10 @@ from astridr.channels.base import (
     MessageHandler,
     OutgoingMessage,
 )
+from astridr.channels.vad import VADDetector, create_vad_detector
 from astridr.channels.wake_word import WakeWordDetector, create_wake_word_detector
+from astridr.core.secrets import get_snapshot
+from astridr.media.tts import STREAM_SAMPLE_RATE
 
 log = structlog.get_logger()
 
@@ -48,17 +51,16 @@ class VoiceChannel(BaseChannel):
         sensitivity: float = 0.5,
         silence_threshold: float = 0.5,
         sample_rate: int = _DEFAULT_SAMPLE_RATE,
-        energy_threshold: float = 500.0,
         tts_tool: Any | None = None,
         transcriber: Any | None = None,
         wake_word_detector: WakeWordDetector | None = None,
+        vad_detector: VADDetector | None = None,
         input_device: int | str | None = None,
     ) -> None:
         self._wake_word = wake_word
         self._sensitivity = sensitivity
         self._silence_threshold = silence_threshold
         self._sample_rate = sample_rate
-        self._energy_threshold = energy_threshold
         self._running = False
         self._on_message: MessageHandler | None = None
         self._tts_tool = tts_tool
@@ -68,8 +70,9 @@ class VoiceChannel(BaseChannel):
         self._detector = wake_word_detector or create_wake_word_detector(
             wake_word=wake_word,
             sensitivity=sensitivity,
-            energy_threshold=energy_threshold,
         )
+        self._vad = vad_detector or create_vad_detector()
+        self._default_voice_id = get_snapshot().get("ELEVENLABS_VOICE_ID", "default")
 
     # ------------------------------------------------------------------
     # BaseChannel interface
@@ -87,21 +90,106 @@ class VoiceChannel(BaseChannel):
         )
 
     async def send(self, message: OutgoingMessage) -> None:
-        """Convert response text to speech and play it back."""
+        """Convert response text to speech and play it back.
+
+        Uses streaming TTS (per D-03) when stream_to_queue is available on the
+        TTS tool. Falls back to batch generation on streaming failure (per D-06)
+        or when streaming is not available (per D-08/STTS-04).
+        """
         if not message.text:
             return
 
-        if self._tts_tool is not None:
-            try:
-                result = await self._tts_tool.execute(text=message.text)
-                if result.success and result.data.get("path"):
-                    await self._play_audio(Path(result.data["path"]))
-                else:
-                    log.warning("voice.tts_failed", error=result.error)
-            except Exception as exc:
-                log.error("voice.send_failed", error=str(exc))
-        else:
+        if self._tts_tool is None:
             log.debug("voice.no_tts", text=message.text[:80])
+            return
+
+        # Read voice identity from metadata (populated by router)
+        meta = message.metadata if hasattr(message, "metadata") else {}
+        voice_id = meta.get("voice_id", self._default_voice_id)
+        stability = meta.get("stability", 0.5)
+        similarity_boost = meta.get("similarity_boost", 0.75)
+
+        # Try streaming path first (per D-01, D-03)
+        if hasattr(self._tts_tool, "stream_to_queue"):
+            try:
+                await self._stream_and_play(
+                    message.text, voice_id, stability, similarity_boost,
+                )
+                return
+            except Exception as exc:
+                log.warning(
+                    "voice.streaming_failed",
+                    error=str(exc),
+                    chars=len(message.text),
+                    method="streaming",
+                    model="eleven_flash_v2_5",
+                )
+                log.info(
+                    "voice.fallback_to_batch",
+                    chars=len(message.text),
+                )
+
+        # Batch fallback (per D-06, D-08)
+        try:
+            result = await self._tts_tool.execute(
+                text=message.text,
+                voice_id=voice_id,
+                stability=stability,
+                similarity_boost=similarity_boost,
+            )
+            if result.success and result.data.get("path"):
+                await self._play_audio(Path(result.data["path"]))
+            else:
+                log.warning("voice.tts_failed", error=result.error)
+        except Exception as exc:
+            log.error("voice.send_failed", error=str(exc))
+
+    async def _stream_and_play(
+        self,
+        text: str,
+        voice_id: str,
+        stability: float,
+        similarity_boost: float,
+    ) -> None:
+        """Stream TTS audio from ElevenLabs and play chunks as they arrive.
+
+        Producer: tts_tool.stream_to_queue() pushes PCM bytes into queue.
+        Consumer: Drains queue, converts to numpy int16, writes to OutputStream.
+        Both run concurrently via asyncio.gather (per D-03).
+
+        TTFB is measured from method entry to first stream.write() call
+        and logged as voice.ttfb_ms (per research Pitfall 6).
+        """
+        import sounddevice as sd
+
+        queue: asyncio.Queue[bytes | None] = asyncio.Queue(maxsize=20)
+        start_time = time.perf_counter()
+        first_write_logged = False
+
+        async def consumer() -> None:
+            nonlocal first_write_logged
+            with sd.OutputStream(
+                samplerate=STREAM_SAMPLE_RATE, channels=1, dtype="int16",
+            ) as stream:
+                while True:
+                    chunk = await queue.get()
+                    if chunk is None:
+                        break
+                    pcm = np.frombuffer(chunk, dtype=np.int16)
+                    await asyncio.to_thread(stream.write, pcm)
+                    if not first_write_logged:
+                        ttfb_ms = round((time.perf_counter() - start_time) * 1000)
+                        log.info("voice.ttfb_ms", ttfb_ms=ttfb_ms)
+                        first_write_logged = True
+
+        await asyncio.gather(
+            self._tts_tool.stream_to_queue(
+                text, voice_id, queue,
+                stability=stability,
+                similarity_boost=similarity_boost,
+            ),
+            consumer(),
+        )
 
     async def send_typing(self, chat_id: str) -> None:
         """Play a brief thinking tone, or do nothing."""
@@ -119,6 +207,7 @@ class VoiceChannel(BaseChannel):
                 pass
             self._listen_task = None
         self._detector.cleanup()
+        self._vad.cleanup()
         self._on_message = None
         log.info("voice.stopped")
 
@@ -232,7 +321,7 @@ class VoiceChannel(BaseChannel):
             )
             recorded.append(raw)
 
-            if self._detect_silence(raw):
+            if not self._vad.is_speech(raw):
                 if silence_start is None:
                     silence_start = time.time()
                 elif time.time() - silence_start >= self._silence_threshold:
@@ -245,6 +334,7 @@ class VoiceChannel(BaseChannel):
             if total_samples / self._sample_rate > 30:
                 break
 
+        self._vad.reset()
         return b"".join(recorded)
 
     async def _transcribe(self, audio_bytes: bytes) -> str:
@@ -289,42 +379,6 @@ class VoiceChannel(BaseChannel):
             )
         except Exception as exc:
             log.warning("voice.playback_error", error=str(exc))
-
-    def _detect_silence(self, audio_chunk: bytes) -> bool:
-        """Check if an audio chunk's energy is below the silence threshold.
-
-        Args:
-            audio_chunk: Raw 16-bit signed PCM audio bytes.
-
-        Returns:
-            True if the audio energy is below the threshold (silence).
-        """
-        energy = self._calculate_energy(audio_chunk)
-        return energy < self._energy_threshold
-
-    def _calculate_energy(self, audio_data: bytes) -> float:
-        """Calculate RMS energy of raw 16-bit PCM audio data.
-
-        Args:
-            audio_data: Raw 16-bit signed little-endian PCM bytes.
-
-        Returns:
-            RMS energy as a float. Returns 0.0 for empty data.
-        """
-        if not audio_data:
-            return 0.0
-
-        # Ensure we have an even number of bytes (16-bit samples)
-        num_samples = len(audio_data) // _BYTES_PER_SAMPLE
-        if num_samples == 0:
-            return 0.0
-
-        # Unpack 16-bit signed integers
-        samples = struct.unpack(f"<{num_samples}h", audio_data[: num_samples * _BYTES_PER_SAMPLE])
-
-        # RMS energy
-        sum_sq = sum(s * s for s in samples)
-        return (sum_sq / num_samples) ** 0.5
 
     def _write_wav(self, path: Path, pcm_data: bytes) -> None:
         """Write raw PCM data as a WAV file.

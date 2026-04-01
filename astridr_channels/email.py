@@ -84,7 +84,7 @@ class EmailChannel(BaseChannel):
         self._thread_map: dict[str, dict[str, str]] = {}
         # key = chat_id (sender email), value = {message_id, references}
 
-    # ── Lifecycle ────────────────────────────────────────────────
+    # ── Lifecycle ────────────────────────────────────────────────────────
 
     async def start(self, on_message: MessageHandler) -> None:
         """Connect to IMAP and begin the polling / IDLE loop."""
@@ -123,7 +123,7 @@ class EmailChannel(BaseChannel):
 
         logger.info("email.stopped")
 
-    # ── Sending ──────────────────────────────────────────────────
+    # ── Sending ──────────────────────────────────────────────────────────
 
     async def send(self, message: OutgoingMessage) -> None:
         """Send an email via SMTP, preserving reply threading."""
@@ -146,7 +146,7 @@ class EmailChannel(BaseChannel):
         """Email has no typing indicator — this is a no-op."""
         logger.debug("email.typing_noop", chat_id=chat_id)
 
-    # ── Internal: polling loop ───────────────────────────────────
+    # ── Internal: polling loop ───────────────────────────────────────────
 
     async def _poll_loop(self) -> None:
         """Poll IMAP for new messages.  Attempts IDLE first, falls back to interval polling."""
@@ -245,7 +245,7 @@ class EmailChannel(BaseChannel):
         except Exception:
             logger.debug("email.mark_seen_failed", uid=uid)
 
-    # ── Internal: email parsing ──────────────────────────────────
+    # ── Internal: email parsing ──────────────────────────────────────────
 
     def _parse_email(self, msg: EmailMessage, uid: str) -> IncomingMessage:
         """Convert a stdlib EmailMessage into an IncomingMessage."""
@@ -367,7 +367,7 @@ class EmailChannel(BaseChannel):
         _, addr = email_lib.utils.parseaddr(from_header)
         return addr or from_header
 
-    # ── Internal: email building ─────────────────────────────────
+    # ── Internal: email building ─────────────────────────────────────────
 
     _SIGNATURE_HTML = """\
 <br><br>
@@ -474,7 +474,7 @@ class EmailChannel(BaseChannel):
         return msg
 
 
-# ── Utility: HTML → plain text ───────────────────────────────────
+# ── Utility: HTML → plain text ───────────────────────────────────────
 
 
 def html_to_text(raw_html: str) -> str:
