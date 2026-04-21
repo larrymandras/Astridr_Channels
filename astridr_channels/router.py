@@ -97,7 +97,6 @@ class MessageRouter:
         hook_registry: Any | None = None,
         snapshot_manager: Any | None = None,
         memory_store: Any | None = None,
-        tool_registry: Any | None = None,
     ) -> None:
         self._profiles = {p.id: p for p in profiles}
         self._telemetry = telemetry
@@ -165,7 +164,6 @@ class MessageRouter:
         self._hook_registry = hook_registry
         self._snapshot_manager = snapshot_manager
         self._memory_store = memory_store
-        self._tool_registry = tool_registry
 
     def _build_profile_index(self, profiles: list[ProfileConfig]) -> None:
         """Pre-build O(1) lookup indexes for profile resolution."""
@@ -420,16 +418,6 @@ class MessageRouter:
             session.messages.append(
                 {"role": "assistant", "content": response.text, "timestamp": time.time()}
             )
-            await self._send_or_queue(channel, response)
-            return
-
-        # 4g. Slash-command interception: /ingest (FIRE-01, Phase 73)
-        if inbound_text.strip().lower().startswith("/ingest"):
-            response = await self._handle_ingest_command(message)
-            session.messages.append(
-                {"role": "assistant", "content": response.text, "timestamp": time.time()}
-            )
-            self._recent_cache.append(session.id, "assistant", response.text)
             await self._send_or_queue(channel, response)
             return
 
@@ -1267,46 +1255,6 @@ class MessageRouter:
             )
         log.info("autonomy_override.set", session_id=session.id, level=level.value)
         return f"Autonomy override set to `{level.value}` for this session."
-
-    async def _handle_ingest_command(self, message: IncomingMessage) -> OutgoingMessage:
-        """Handle /ingest <url> -- scrape URL to markdown via FirecrawlTool (FIRE-01)."""
-        parts = message.text.strip().split(maxsplit=1)
-        if len(parts) < 2:
-            return OutgoingMessage(
-                text="Usage: /ingest <url>",
-                chat_id=message.chat_id,
-            )
-        url = parts[1].strip()
-
-        # Resolve FirecrawlTool from registry
-        if self._tool_registry is None:
-            return OutgoingMessage(
-                text="Tool registry not available -- cannot run /ingest.",
-                chat_id=message.chat_id,
-            )
-        tool = self._tool_registry.get("firecrawl_ingest")
-        if tool is None:
-            return OutgoingMessage(
-                text="FirecrawlTool is not registered. Check config.firecrawl.enabled.",
-                chat_id=message.chat_id,
-            )
-
-        result = await tool.execute(url=url)
-        if not result.success:
-            return OutgoingMessage(
-                text=f"Ingest failed: {result.error}",
-                chat_id=message.chat_id,
-            )
-
-        output = result.output or ""
-        # Truncate if very long (markdown can be large)
-        if len(output) > 4000:
-            output = output[:4000] + "\n\n... [truncated -- full content available in tool output]"
-
-        return OutgoingMessage(
-            text=output,
-            chat_id=message.chat_id,
-        )
 
     def _apply_profile_to_session(self, session: Session, agent_profile: Any) -> None:
         """Apply an AgentProfile to the agent session (prompt rebuild + tool filtering)."""

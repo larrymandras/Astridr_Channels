@@ -9,6 +9,7 @@ from enum import Enum
 from pathlib import Path
 from typing import Any
 
+import numpy as np
 import structlog
 
 from astridr.channels.base import (
@@ -134,7 +135,6 @@ class VoiceChannel(BaseChannel):
 
     async def _play_confirmation_tone(self) -> None:
         """Play a 440 Hz sine wave confirmation tone via sounddevice (D-08, D-09)."""
-        import numpy as np
         import sounddevice as sd
 
         sample_rate = 22050
@@ -243,7 +243,6 @@ class VoiceChannel(BaseChannel):
         TTFB is measured from method entry to first stream.write() call
         and logged as voice.ttfb_ms (per research Pitfall 6).
         """
-        import numpy as np
         import sounddevice as sd
 
         queue: asyncio.Queue[bytes | None] = asyncio.Queue(maxsize=20)

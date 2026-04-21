@@ -17,6 +17,7 @@ from pathlib import Path
 from typing import Any
 
 import structlog
+import uvicorn
 from fastapi import FastAPI, Form, Request, UploadFile
 from fastapi.responses import FileResponse, HTMLResponse, JSONResponse, StreamingResponse
 
@@ -318,8 +319,6 @@ class WebChannel(BaseChannel):
 
     async def start(self, on_message: MessageHandler) -> None:
         """Create the FastAPI app, mount routes, and start uvicorn."""
-        import uvicorn
-
         self._on_message = on_message
         self._setup_app()
         self._running = True
