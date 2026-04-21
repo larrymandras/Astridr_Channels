@@ -17,7 +17,6 @@ from pathlib import Path
 from typing import Any
 
 import structlog
-import uvicorn
 from fastapi import FastAPI, Form, Request, UploadFile
 from fastapi.responses import FileResponse, HTMLResponse, JSONResponse, StreamingResponse
 
@@ -319,8 +318,11 @@ class WebChannel(BaseChannel):
 
     async def start(self, on_message: MessageHandler) -> None:
         """Create the FastAPI app, mount routes, and start uvicorn."""
+        import uvicorn
+
         self._on_message = on_message
-        self._setup_app()
+        if self._app is None:
+            self._setup_app()
         self._running = True
 
         logger.info("web.starting", host=self._host, port=self._port)
@@ -467,11 +469,23 @@ class WebChannel(BaseChannel):
     def _setup_app(self) -> None:
         """Create the FastAPI application with routes and middleware."""
         self._app = FastAPI(title="Astridr Web Chat", docs_url=None, redoc_url=None)
+        self._add_cors_middleware()
         self._add_security_middleware()
         # Dashboard routes must register BEFORE catch-all /{profile_path} routes
         register_briefing_dashboard(self._app)
         register_canvas_dashboard(self._app)
         self._register_routes()
+
+    def _add_cors_middleware(self) -> None:
+        """Add CORS middleware for cross-origin CodePulse API calls."""
+        from fastapi.middleware.cors import CORSMiddleware
+
+        self._app.add_middleware(
+            CORSMiddleware,
+            allow_origin_regex=r"^http://localhost:\d+$",
+            allow_methods=["GET", "POST", "PUT", "DELETE", "OPTIONS"],
+            allow_headers=["*"],
+        )
 
     def _add_security_middleware(self) -> None:
         """Add security headers, API key auth, and rate-limiting middleware."""
