@@ -109,33 +109,36 @@ class TelegramChannel(BaseChannel):
         bot = self._application.bot
         chat_id = int(message.chat_id)
 
-        chunks = split_message(message.text)
+        # Only send text chunks if there is visible text content
+        stripped = message.text.replace("\u200b", "").strip()
+        if stripped:
+            chunks = split_message(message.text)
 
-        for i, chunk in enumerate(chunks):
-            is_last = i == len(chunks) - 1
-            kwargs: dict[str, Any] = {
-                "chat_id": chat_id,
-                "text": chunk,
-            }
+            for i, chunk in enumerate(chunks):
+                is_last = i == len(chunks) - 1
+                kwargs: dict[str, Any] = {
+                    "chat_id": chat_id,
+                    "text": chunk,
+                }
 
-            if message.parse_mode:
-                kwargs["parse_mode"] = message.parse_mode
+                if message.parse_mode:
+                    kwargs["parse_mode"] = message.parse_mode
 
-            if message.reply_to_message_id:
-                kwargs["reply_to_message_id"] = int(message.reply_to_message_id)
+                if message.reply_to_message_id:
+                    kwargs["reply_to_message_id"] = int(message.reply_to_message_id)
 
-            # Attach inline keyboard only to the last chunk
-            if is_last and message.buttons:
-                keyboard = self._build_inline_keyboard(message.buttons)
-                kwargs["reply_markup"] = keyboard
+                # Attach inline keyboard only to the last chunk
+                if is_last and message.buttons:
+                    keyboard = self._build_inline_keyboard(message.buttons)
+                    kwargs["reply_markup"] = keyboard
 
-            await bot.send_message(**kwargs)
+                await bot.send_message(**kwargs)
 
         # Send attachments
         for attachment in message.attachments:
             await self._send_attachment(bot, chat_id, attachment)
 
-        logger.debug("telegram.sent", chat_id=chat_id, chunks=len(chunks))
+        logger.debug("telegram.sent", chat_id=chat_id, chunks=len(chunks) if stripped else 0)
 
     async def send_typing(self, chat_id: str) -> None:
         """Send a 'typing' chat action to the user."""

@@ -5,10 +5,10 @@ from __future__ import annotations
 import asyncio
 import time
 import uuid
+from enum import Enum
 from pathlib import Path
 from typing import Any
 
-import numpy as np
 import structlog
 
 from astridr.channels.base import (
@@ -34,6 +34,15 @@ _BYTES_PER_SAMPLE = 2
 _CHUNK_SAMPLES = 512
 
 
+class ConversationState(Enum):
+    """State machine states for multi-turn conversation mode (D-10)."""
+
+    IDLE = "idle"
+    WAKE_DETECTED = "wake_detected"
+    LISTENING = "listening"
+    PROCESSING = "processing"
+
+
 class VoiceChannel(BaseChannel):
     """Always-on voice channel with wake word detection.
 
@@ -56,6 +65,7 @@ class VoiceChannel(BaseChannel):
         wake_word_detector: WakeWordDetector | None = None,
         vad_detector: VADDetector | None = None,
         input_device: int | str | None = None,
+        end_phrases: list[str] | None = None,
     ) -> None:
         self._wake_word = wake_word
         self._sensitivity = sensitivity
@@ -72,7 +82,74 @@ class VoiceChannel(BaseChannel):
             sensitivity=sensitivity,
         )
         self._vad = vad_detector or create_vad_detector()
-        self._default_voice_id = get_snapshot().get("ELEVENLABS_VOICE_ID", "default")
+        self._default_voice_id = get_snapshot().get("ELEVENLABS_VOICE_ID") or ""
+        # Session state attributes (conversation mode — D-10, D-11)
+        self._state: ConversationState = ConversationState.IDLE
+        self._session_id: str | None = None
+        self._turn_count: int = 0
+        self._session_start: float | None = None
+        self._tts_complete: asyncio.Event = asyncio.Event()
+        self._end_phrases: list[str] = end_phrases if end_phrases is not None else [
+            "goodbye", "that's all", "thanks", "stop",
+        ]
+
+    # ------------------------------------------------------------------
+    # State machine
+    # ------------------------------------------------------------------
+
+    def _transition(self, to: ConversationState) -> None:
+        """Transition to a new state and emit a structured log event (D-11)."""
+        from_state = self._state
+        self._state = to
+        elapsed = (
+            round(time.perf_counter() - self._session_start, 2)
+            if self._session_start is not None else 0.0
+        )
+        log.info(
+            "voice.state_change",
+            from_state=from_state.value,
+            to_state=to.value,
+            session_id=self._session_id,
+            turn_count=self._turn_count,
+            elapsed_seconds=elapsed,
+        )
+
+    async def _cleanup_session(self, reason: str) -> None:
+        """Reset all session state and transition to IDLE (CONV-04)."""
+        log.info(
+            "voice.session_end",
+            reason=reason,
+            session_id=self._session_id,
+            turn_count=self._turn_count,
+        )
+        self._session_id = None
+        self._session_start = None
+        self._turn_count = 0
+        self._tts_complete.set()
+        self._transition(ConversationState.IDLE)
+
+    def _is_end_phrase(self, text: str) -> bool:
+        """Return True if text (stripped, lowercased) exactly matches an end phrase (D-06)."""
+        return text.lower().strip() in self._end_phrases
+
+    async def _play_confirmation_tone(self) -> None:
+        """Play a 440 Hz sine wave confirmation tone via sounddevice (D-08, D-09)."""
+        import numpy as np
+        import sounddevice as sd
+
+        sample_rate = 22050
+        duration = 0.1
+        freq = 440.0
+        t = np.linspace(0, duration, int(sample_rate * duration), endpoint=False)
+        tone = (np.sin(2 * np.pi * freq * t) * 0.3 * 32767).astype(np.int16)
+        loop = asyncio.get_event_loop()
+        try:
+            await loop.run_in_executor(
+                None,
+                lambda: (sd.play(tone, sample_rate), sd.wait()),
+            )
+        except Exception as exc:
+            log.debug("voice.tone_failed", error=str(exc))
 
     # ------------------------------------------------------------------
     # BaseChannel interface
@@ -95,54 +172,60 @@ class VoiceChannel(BaseChannel):
         Uses streaming TTS (per D-03) when stream_to_queue is available on the
         TTS tool. Falls back to batch generation on streaming failure (per D-06)
         or when streaming is not available (per D-08/STTS-04).
+
+        Always sets _tts_complete in finally block to prevent state machine deadlock
+        (Pitfall 1 — D-01/D-03).
         """
-        if not message.text:
-            return
-
-        if self._tts_tool is None:
-            log.debug("voice.no_tts", text=message.text[:80])
-            return
-
-        # Read voice identity from metadata (populated by router)
-        meta = message.metadata if hasattr(message, "metadata") else {}
-        voice_id = meta.get("voice_id", self._default_voice_id)
-        stability = meta.get("stability", 0.5)
-        similarity_boost = meta.get("similarity_boost", 0.75)
-
-        # Try streaming path first (per D-01, D-03)
-        if hasattr(self._tts_tool, "stream_to_queue"):
-            try:
-                await self._stream_and_play(
-                    message.text, voice_id, stability, similarity_boost,
-                )
-                return
-            except Exception as exc:
-                log.warning(
-                    "voice.streaming_failed",
-                    error=str(exc),
-                    chars=len(message.text),
-                    method="streaming",
-                    model="eleven_flash_v2_5",
-                )
-                log.info(
-                    "voice.fallback_to_batch",
-                    chars=len(message.text),
-                )
-
-        # Batch fallback (per D-06, D-08)
         try:
-            result = await self._tts_tool.execute(
-                text=message.text,
-                voice_id=voice_id,
-                stability=stability,
-                similarity_boost=similarity_boost,
-            )
-            if result.success and result.data.get("path"):
-                await self._play_audio(Path(result.data["path"]))
-            else:
-                log.warning("voice.tts_failed", error=result.error)
-        except Exception as exc:
-            log.error("voice.send_failed", error=str(exc))
+            if not message.text:
+                return
+
+            if self._tts_tool is None:
+                log.debug("voice.no_tts", text=message.text[:80])
+                return
+
+            # Read voice identity from metadata (populated by router)
+            meta = message.metadata if hasattr(message, "metadata") else {}
+            voice_id = meta.get("voice_id", self._default_voice_id)
+            stability = meta.get("stability", 0.5)
+            similarity_boost = meta.get("similarity_boost", 0.75)
+
+            # Try streaming path first (per D-01, D-03)
+            if hasattr(self._tts_tool, "stream_to_queue"):
+                try:
+                    await self._stream_and_play(
+                        message.text, voice_id, stability, similarity_boost,
+                    )
+                    return
+                except Exception as exc:
+                    log.warning(
+                        "voice.streaming_failed",
+                        error=str(exc),
+                        chars=len(message.text),
+                        method="streaming",
+                        model="eleven_flash_v2_5",
+                    )
+                    log.info(
+                        "voice.fallback_to_batch",
+                        chars=len(message.text),
+                    )
+
+            # Batch fallback (per D-06, D-08)
+            try:
+                result = await self._tts_tool.execute(
+                    text=message.text,
+                    voice_id=voice_id,
+                    stability=stability,
+                    similarity_boost=similarity_boost,
+                )
+                if result.success and result.data.get("path"):
+                    await self._play_audio(Path(result.data["path"]))
+                else:
+                    log.warning("voice.tts_failed", error=result.error)
+            except Exception as exc:
+                log.error("voice.send_failed", error=str(exc))
+        finally:
+            self._tts_complete.set()
 
     async def _stream_and_play(
         self,
@@ -160,6 +243,7 @@ class VoiceChannel(BaseChannel):
         TTFB is measured from method entry to first stream.write() call
         and logged as voice.ttfb_ms (per research Pitfall 6).
         """
+        import numpy as np
         import sounddevice as sd
 
         queue: asyncio.Queue[bytes | None] = asyncio.Queue(maxsize=20)
@@ -199,6 +283,8 @@ class VoiceChannel(BaseChannel):
     async def stop(self) -> None:
         """Stop listening and clean up resources."""
         self._running = False
+        if self._state != ConversationState.IDLE:
+            await self._cleanup_session("stopped")
         if self._listen_task is not None:
             self._listen_task.cancel()
             try:
@@ -212,57 +298,114 @@ class VoiceChannel(BaseChannel):
         log.info("voice.stopped")
 
     # ------------------------------------------------------------------
-    # Listening loop
+    # Listening loop and state machine handlers
     # ------------------------------------------------------------------
 
     async def _listen_loop(self) -> None:
-        """Main loop: detect wake word, record, transcribe, dispatch."""
+        """Main loop: match/case state machine dispatching to state handlers."""
         try:
             while self._running:
-                # Wait for wake word
-                detected = await self._wait_for_wake_word()
-                if not detected or not self._running:
-                    continue
-
-                log.info("voice.wake_word_detected", wake_word=self._wake_word)
-
-                # Record until silence
-                audio_bytes = await self._record_until_silence()
-                if not audio_bytes:
-                    continue
-
-                # Transcribe
-                text = await self._transcribe(audio_bytes)
-                if not text:
-                    continue
-
-                # Filter by wake word
-                text_lower = text.lower().strip()
-                wake = self._wake_word.lower()
-                if text_lower.startswith(wake):
-                    text = text[len(wake):].strip()
-                    if not text:
-                        text = text_lower  # Wake word only — treat as greeting
-                elif wake not in text_lower:
-                    log.debug("voice.no_wake_word", transcript=text[:50])
-                    continue  # Discard — false activation
-
-                # Dispatch to handler
-                if self._on_message is not None:
-                    msg = IncomingMessage(
-                        text=text,
-                        sender_id="voice_user",
-                        chat_id="voice",
-                        channel_id=self.channel_id,
-                        timestamp=time.time(),
-                        raw={"source": "microphone", "sample_rate": self._sample_rate},
-                    )
-                    await self._on_message(msg)
-
+                match self._state:
+                    case ConversationState.IDLE:
+                        await self._handle_idle()
+                    case ConversationState.WAKE_DETECTED:
+                        await self._handle_wake_detected()
+                    case ConversationState.LISTENING:
+                        await self._handle_listening()
+                    case ConversationState.PROCESSING:
+                        await self._handle_processing()
         except asyncio.CancelledError:
+            await self._cleanup_session("cancelled")
             return
         except Exception as exc:
             log.error("voice.listen_loop_error", error=str(exc))
+            await self._cleanup_session("error")
+
+    async def _handle_idle(self) -> None:
+        """IDLE: wait for wake word, then transition to WAKE_DETECTED."""
+        detected = await self._wait_for_wake_word()
+        if detected and self._running:
+            self._transition(ConversationState.WAKE_DETECTED)
+
+    async def _handle_wake_detected(self) -> None:
+        """WAKE_DETECTED: initialize session and play confirmation tone, then transition to LISTENING."""
+        self._session_id = uuid.uuid4().hex[:12]
+        self._session_start = time.perf_counter()
+        self._turn_count = 0
+        self._tts_complete.set()
+        log.info("voice.wake_word_detected", wake_word=self._wake_word, session_id=self._session_id)
+        await self._play_confirmation_tone()
+        self._transition(ConversationState.LISTENING)
+
+    async def _handle_listening(self) -> None:
+        """LISTENING: record audio, transcribe, check end phrases, and dispatch message."""
+        # D-04: 5-minute max duration cap
+        if self._session_start is not None and time.perf_counter() - self._session_start > 300.0:
+            await self._cleanup_session("max_duration")
+            return
+
+        # D-07: 30-second silence timeout
+        try:
+            audio_bytes = await asyncio.wait_for(
+                self._record_until_silence(),
+                timeout=30.0,
+            )
+        except asyncio.TimeoutError:
+            log.info("voice.session_timeout", session_id=self._session_id)
+            await self._cleanup_session("timeout")
+            return
+
+        if not audio_bytes:
+            return  # Stay in LISTENING
+
+        text = await self._transcribe(audio_bytes)
+        if not text:
+            return  # Stay in LISTENING
+
+        # D-06: Check for end phrases
+        if self._is_end_phrase(text):
+            log.info("voice.end_phrase", text=text, session_id=self._session_id)
+            await self._cleanup_session("end_phrase")
+            return
+
+        # Wake word filtering only on first turn (turn_count == 0)
+        if self._turn_count == 0:
+            text_lower = text.lower().strip()
+            wake = self._wake_word.lower()
+            if text_lower.startswith(wake):
+                text = text[len(wake):].strip()
+                if not text:
+                    text = text_lower  # Wake word only — treat as greeting
+            elif wake not in text_lower:
+                log.debug("voice.no_wake_word", transcript=text[:50])
+                await self._cleanup_session("no_wake_word")
+                return
+
+        # Dispatch to handler
+        if self._on_message is not None:
+            msg = IncomingMessage(
+                text=text,
+                sender_id="voice_user",
+                chat_id="voice",
+                channel_id=self.channel_id,
+                timestamp=time.time(),
+                raw={
+                    "source": "microphone",
+                    "sample_rate": self._sample_rate,
+                    "session_id": self._session_id,
+                    "turn_count": self._turn_count,
+                },
+            )
+            self._transition(ConversationState.PROCESSING)
+            await self._on_message(msg)
+
+    async def _handle_processing(self) -> None:
+        """PROCESSING: wait for TTS to complete, then transition back to LISTENING."""
+        # D-01/D-03: Wait for TTS to complete before re-listening (mic muted during TTS)
+        await self._tts_complete.wait()
+        self._tts_complete.clear()
+        self._turn_count += 1
+        self._transition(ConversationState.LISTENING)
 
     async def _wait_for_wake_word(self) -> bool:
         """Listen for the wake word using the configured detector.

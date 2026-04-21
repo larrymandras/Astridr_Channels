@@ -25,9 +25,18 @@ from astridr.channels.base import (
     OutgoingMessage,
 )
 from astridr.engine.config import PersonaConfig, ProfileConfig
+from astridr.engine.estop import EmergencyStop
+from astridr.engine.session_keys import SessionKeyComposer
 from astridr.engine.voice_identity import VoiceIdentityResolver
 from astridr.engine.telemetry import ConvexHandler
 from astridr.memory.recent_cache import RecentContextCache
+
+# Phase 44 hook imports (lazy to avoid circular)
+try:
+    from astridr.engine.hooks import HookContext, HookPoint
+except ImportError:  # pragma: no cover
+    HookContext = None  # type: ignore[assignment,misc]
+    HookPoint = None  # type: ignore[assignment,misc]
 
 # Optional import — profiles module may not be available yet during early bootstrap
 try:
@@ -81,15 +90,35 @@ class MessageRouter:
         episodic: Any | None = None,
         message_queue: Any | None = None,
         connectivity_monitor: Any | None = None,
+        flow_registry: Any | None = None,
+        stall_detector: Any | None = None,
+        key_composer: SessionKeyComposer | None = None,
+        estop: EmergencyStop | None = None,
+        hook_registry: Any | None = None,
+        snapshot_manager: Any | None = None,
+        memory_store: Any | None = None,
+        tool_registry: Any | None = None,
     ) -> None:
         self._profiles = {p.id: p for p in profiles}
         self._telemetry = telemetry
         self._emergency_stop = emergency_stop
+        self._estop = estop
+
+        # Pre-built profile resolution indexes (avoid O(n) loops per message)
+        self._mapping_index: dict[str, dict[str, str]] = {}   # {channel_type: {chat_id: profile_id}}
+        self._web_prefix_index: dict[str, list[tuple[str, str]]] = {}  # {channel_type: [(prefix, profile_id)]}
+        self._default_for_index: dict[str, str] = {}           # {channel_type: profile_id}
+        self._channels_index: dict[str, str] = {}              # {channel_type: profile_id}
+        self._wildcard_profile_id: str | None = None
+        self._build_profile_index(profiles)
         self._persistence = persistence
         self._episodic = episodic
+        self._stall_detector = stall_detector
+        self._key_composer = key_composer
 
-        # Sessions keyed by (channel_id, chat_id)
-        self._sessions: dict[tuple[str, str], Session] = {}
+        # Sessions keyed by composite key (str) when key_composer is set,
+        # or by (channel_id, chat_id) tuple for legacy backward compatibility.
+        self._sessions: dict[Any, Session] = {}
 
         # Agent loop (injected from bootstrap)
         self._agent_loop_instance = agent_loop
@@ -119,6 +148,61 @@ class MessageRouter:
 
         # Hot cache for recent conversation context (Pattern 6)
         self._recent_cache = RecentContextCache()
+
+        # Plugin channel registry — keyed by channel_id (CHAN-03)
+        self._plugin_channels: dict[str, BaseChannel] = {}
+
+        # Flow registry for /tasks command (ORCH-07)
+        self._flow_registry: Any | None = flow_registry
+
+        # ModelRouter reference for /model command session overrides (ROUTE-05)
+        self._model_router: Any | None = None
+
+        # Turn lock per chat_id — prevents heartbeat alert + user message interleaving (D-10)
+        self._turn_locks: dict[str, asyncio.Lock] = {}
+
+        # Phase 44 operations components — all optional
+        self._hook_registry = hook_registry
+        self._snapshot_manager = snapshot_manager
+        self._memory_store = memory_store
+        self._tool_registry = tool_registry
+
+    def _build_profile_index(self, profiles: list[ProfileConfig]) -> None:
+        """Pre-build O(1) lookup indexes for profile resolution."""
+        for profile in profiles:
+            for ch_type, chat_ids in profile.channel_mappings.items():
+                if ch_type == "web":
+                    self._web_prefix_index.setdefault(ch_type, []).extend(
+                        (prefix, profile.id) for prefix in chat_ids
+                    )
+                else:
+                    mapping = self._mapping_index.setdefault(ch_type, {})
+                    for cid in chat_ids:
+                        mapping[cid] = profile.id
+            for ch_type in profile.default_for:
+                self._default_for_index.setdefault(ch_type, profile.id)
+            for ch_type in profile.channels:
+                if ch_type == "*":
+                    self._wildcard_profile_id = self._wildcard_profile_id or profile.id
+                else:
+                    self._channels_index.setdefault(ch_type, profile.id)
+
+    # -- Setters for post-construction injection --------------------------------
+
+    def set_model_router(self, router: Any) -> None:
+        """Wire the ModelRouter for /model command session override management (ROUTE-05)."""
+        self._model_router = router
+
+    def get_turn_lock(self, chat_id: str) -> asyncio.Lock:
+        """Get or create the turn lock for a chat_id (D-10).
+
+        Each chat_id gets its own asyncio.Lock so concurrent heartbeat alerts
+        and user messages on the same chat are serialized without blocking
+        unrelated chats.
+        """
+        if chat_id not in self._turn_locks:
+            self._turn_locks[chat_id] = asyncio.Lock()
+        return self._turn_locks[chat_id]
 
     # -- Episodic helpers ------------------------------------------------------
 
@@ -178,8 +262,24 @@ class MessageRouter:
     async def route(self, message: IncomingMessage, channel: BaseChannel) -> None:
         """Full routing pipeline for an incoming message."""
 
-        # 1. Emergency stop -- drop everything
-        if self._emergency_stop:
+        # 1. Emergency stop — queue (global estop) or drop (legacy bool)
+        if self._estop and self._estop.is_active:
+            self._estop.queue_message(
+                {
+                    "sender_id": message.sender_id,
+                    "channel_id": message.channel_id,
+                    "chat_id": message.chat_id,
+                    "content": message.text,
+                    "queued_at": time.time(),
+                }
+            )
+            logger.warning(
+                "router.message_queued_estop",
+                sender=message.sender_id,
+                channel=message.channel_id,
+            )
+            return
+        elif self._emergency_stop:
             logger.warning("router.emergency_stop", sender=message.sender_id)
             await self._telemetry.send(
                 "security_event",
@@ -191,6 +291,13 @@ class MessageRouter:
             )
             return
 
+        lock = self.get_turn_lock(message.chat_id)
+        async with lock:
+            # 2. Resolve profile
+            await self._route_locked(message, channel)
+
+    async def _route_locked(self, message: IncomingMessage, channel: BaseChannel) -> None:
+        """Execute routing pipeline steps 2-8 under the chat_id turn lock."""
         # 2. Resolve profile
         try:
             profile = self.resolve_profile(
@@ -234,7 +341,17 @@ class MessageRouter:
             except Exception:
                 logger.exception("router.security_inbound_error")
 
-        # 4b. Slash-command interception: /profile
+        # 4b. Slash-command interception: /tasks (ORCH-07)
+        if inbound_text.strip().lower() == "/tasks":
+            response = await self._handle_tasks_command(message)
+            session.messages.append(
+                {"role": "assistant", "content": response.text, "timestamp": time.time()}
+            )
+            self._recent_cache.append(session.id, "assistant", response.text)
+            await self._send_or_queue(channel, response)
+            return
+
+        # 4c. Slash-command interception: /profile
         if inbound_text.strip().startswith("/profile"):
             response_text = await self._handle_profile_command(
                 inbound_text.strip(), session, profile
@@ -251,8 +368,75 @@ class MessageRouter:
             await self._send_or_queue(channel, outgoing)
             return
 
+        # 4d. Slash-command interception: /model (ROUTE-05)
+        if inbound_text.strip().lower().startswith("/model"):
+            response_text = await self._handle_model_command(
+                inbound_text.strip(), session
+            )
+            session.messages.append(
+                {"role": "assistant", "content": response_text, "timestamp": time.time()}
+            )
+            self._recent_cache.append(session.id, "assistant", response_text)
+            outgoing = OutgoingMessage(
+                text=response_text,
+                chat_id=message.chat_id,
+                reply_to_message_id=message.reply_to_message_id,
+            )
+            await self._send_or_queue(channel, outgoing)
+            return
+
+        # 4e. Slash-command interception: /autonomy (AP-09, D-05)
+        if inbound_text.strip().lower().startswith("/autonomy"):
+            response_text = await self._handle_autonomy_command(
+                inbound_text.strip(), session
+            )
+            session.messages.append(
+                {"role": "assistant", "content": response_text, "timestamp": time.time()}
+            )
+            self._recent_cache.append(session.id, "assistant", response_text)
+            outgoing = OutgoingMessage(
+                text=response_text,
+                chat_id=message.chat_id,
+                reply_to_message_id=message.reply_to_message_id,
+            )
+            await self._send_or_queue(channel, outgoing)
+            return
+
+        # 4f. Slash-command interception: /pair-whatsapp (Phase 68, D-10)
+        if inbound_text.strip().lower() == "/pair-whatsapp":
+            whatsapp_ch = self._plugin_channels.get("whatsapp")
+            if whatsapp_ch and hasattr(whatsapp_ch, "request_pairing"):
+                try:
+                    await whatsapp_ch.request_pairing()
+                    response_text = "WhatsApp pairing initiated. Check Telegram for the QR code."
+                except Exception as exc:
+                    response_text = f"Failed to start WhatsApp pairing: {exc}"
+            else:
+                response_text = "WhatsApp channel is not configured."
+            response = OutgoingMessage(
+                text=response_text,
+                chat_id=message.chat_id,
+            )
+            session.messages.append(
+                {"role": "assistant", "content": response.text, "timestamp": time.time()}
+            )
+            await self._send_or_queue(channel, response)
+            return
+
+        # 4g. Slash-command interception: /ingest (FIRE-01, Phase 73)
+        if inbound_text.strip().lower().startswith("/ingest"):
+            response = await self._handle_ingest_command(message)
+            session.messages.append(
+                {"role": "assistant", "content": response.text, "timestamp": time.time()}
+            )
+            self._recent_cache.append(session.id, "assistant", response.text)
+            await self._send_or_queue(channel, response)
+            return
+
         # 5. Agent loop
         response_text = await self._process_agent(inbound_text, message, session, profile)
+        if self._stall_detector is not None:
+            self._stall_detector.update_message_processed()
         session.messages.append(
             {
                 "role": "assistant",
@@ -281,52 +465,45 @@ class MessageRouter:
             except Exception:
                 logger.exception("router.security_outbound_error")
 
-        # 7. TTS generation (if enabled on the profile)
-        tts_attachments: list[Attachment] = []
+        # 7. Send text response immediately (don't block on TTS)
         voice_meta: dict[str, Any] = {}
-
-        if profile.tts_enabled:
+        if profile.tts_enabled and channel.channel_id in ("voice", "web"):
             persona_id = getattr(profile, "persona_id", None)
+            try:
+                voice_id, stability, similarity_boost = self._voice_resolver.resolve(persona_id)
+                voice_meta = {
+                    "voice_id": voice_id,
+                    "stability": stability,
+                    "similarity_boost": similarity_boost,
+                }
+            except Exception:
+                logger.warning("router.voice_resolve_failed", persona_id=persona_id)
 
-            # Resolve voice identity for metadata — voice and web channels (per RESEARCH.md Pattern 3 / Phase 4)
-            if channel.channel_id in ("voice", "web"):
-                try:
-                    voice_id, stability, similarity_boost = self._voice_resolver.resolve(persona_id)
-                    voice_meta = {
-                        "voice_id": voice_id,
-                        "stability": stability,
-                        "similarity_boost": similarity_boost,
-                    }
-                except Exception:
-                    logger.warning("router.voice_resolve_failed", persona_id=persona_id)
-
-            # Generate file-based TTS attachment (batch path for Telegram, Web — per D-08/STTS-04)
-            tts_attachment = await self._generate_tts(
-                final_text,
-                persona_id=persona_id,
-            )
-            if tts_attachment is not None:
-                tts_attachments.append(tts_attachment)
-
-        # 8. Send response back via channel
         outgoing = OutgoingMessage(
             text=final_text,
             chat_id=message.chat_id,
             reply_to_message_id=message.reply_to_message_id,
-            attachments=tts_attachments,
             metadata=voice_meta,
         )
-
         await self._send_or_queue(channel, outgoing)
 
-        # Persist session snapshot (fire-and-forget)
+        # 7b. TTS generation as non-blocking follow-up
+        if profile.tts_enabled:
+            persona_id = getattr(profile, "persona_id", None)
+            asyncio.create_task(self._send_tts_followup(
+                channel, message.chat_id, final_text, persona_id,
+                message.reply_to_message_id,
+            ))
+
+        # Persist session snapshot (fire-and-forget with snapshot copy)
         if self._persistence is not None:
-            turn_count = len([m for m in session.messages if m.get("role") == "user"])
+            msg_snapshot = list(session.messages)  # snapshot to avoid race with mutations
+            turn_count = sum(1 for m in msg_snapshot if m.get("role") == "user")
             self._persistence.upsert_session_bg(
                 session_id=session.id,
                 profile_id=profile.id,
                 channel_id=channel.channel_id,
-                messages=session.messages,
+                messages=msg_snapshot,
                 turn_count=turn_count,
             )
 
@@ -361,28 +538,26 @@ class MessageRouter:
 
         channel_type = channel.channel_id
 
-        # Tier 1: channel_mappings — exact chat_id match
+        # Tier 1: channel_mappings — O(1) indexed lookup
         if chat_id:
-            for profile in self._profiles.values():
-                mapped_ids = profile.channel_mappings.get(channel_type, [])
-                if channel_type == "web":
-                    # Web uses startswith for path prefixes
-                    for prefix in mapped_ids:
-                        if chat_id.startswith(prefix):
-                            return profile
-                else:
-                    if chat_id in mapped_ids:
-                        return profile
+            if channel_type == "web":
+                for prefix, pid in self._web_prefix_index.get(channel_type, []):
+                    if chat_id.startswith(prefix):
+                        return self._profiles[pid]
+            else:
+                pid = self._mapping_index.get(channel_type, {}).get(chat_id)
+                if pid is not None:
+                    return self._profiles[pid]
 
-        # Tier 2: default_for — catch-all for unmapped traffic on this channel
-        for profile in self._profiles.values():
-            if channel_type in profile.default_for:
-                return profile
+        # Tier 2: default_for — O(1) indexed lookup
+        pid = self._default_for_index.get(channel_type)
+        if pid is not None:
+            return self._profiles[pid]
 
-        # Tier 3: channels list — backward compat broad match
-        for profile in self._profiles.values():
-            if channel_type in profile.channels or "*" in profile.channels:
-                return profile
+        # Tier 3: channels list — O(1) indexed lookup
+        pid = self._channels_index.get(channel_type) or self._wildcard_profile_id
+        if pid is not None:
+            return self._profiles[pid]
 
         raise ValueError(
             f"No profile found for sender={sender_id} channel={channel_type} chat_id={chat_id}"
@@ -396,11 +571,64 @@ class MessageRouter:
     ) -> Session:
         """Retrieve an existing session or create a new one.
 
-        Sessions are keyed by (channel_id, chat_id) so the same user
-        on different channels gets separate sessions.
+        When a ``key_composer`` was provided at construction time, sessions are
+        keyed by the deterministic composite key (F-06).  Otherwise the legacy
+        ``(channel_id, chat_id)`` tuple key is used for backward compatibility.
         """
-        key = (channel_id, chat_id)
+        if self._key_composer:
+            composite_key = self._key_composer.compose(profile.id, channel_id, chat_id)
 
+            # Check in-memory by composite key
+            if composite_key in self._sessions:
+                return self._sessions[composite_key]
+
+            session = Session(
+                id=str(uuid.uuid4()),
+                chat_id=chat_id,
+                profile_id=profile.id,
+                channel_id=channel_id,
+            )
+            self._sessions[composite_key] = session
+
+            # Persist the composite key to Supabase (fire-and-forget)
+            if self._persistence:
+                self._persistence.persist_session_key(session.id, composite_key)
+
+            logger.info(
+                "router.session_created",
+                session_id=session.id,
+                chat_id=chat_id,
+                profile=profile.id,
+                channel=channel_id,
+                session_key=composite_key,
+            )
+            self._record_event(
+                "astridr", "session_start",
+                f"Session started on {channel_id}",
+                {
+                    "session_id": session.id,
+                    "profile_id": profile.id,
+                    "channel_id": channel_id,
+                    "session_key": composite_key,
+                },
+            )
+
+            # SESSION_START hook (AP-20)
+            if self._hook_registry is not None:
+                asyncio.create_task(
+                    self._fire_session_hook(HookPoint.SESSION_START, session.id)
+                )
+
+            # Snapshot restore: re-queue pending_tool_calls, flush memory_cache (AP-19, D-17)
+            if self._snapshot_manager is not None:
+                asyncio.create_task(
+                    self._restore_session_snapshot(session, composite_key)
+                )
+
+            return session
+
+        # Legacy path: tuple key (backward compat — no key_composer)
+        key = (channel_id, chat_id)
         if key in self._sessions:
             return self._sessions[key]
 
@@ -419,22 +647,201 @@ class MessageRouter:
             profile=profile.id,
             channel=channel_id,
         )
-
-        self._record_event("astridr", "session_start",
+        self._record_event(
+            "astridr", "session_start",
             f"Session started on {channel_id}",
-            {"session_id": session.id, "profile_id": profile.id, "channel_id": channel_id})
+            {"session_id": session.id, "profile_id": profile.id, "channel_id": channel_id},
+        )
+
+        # SESSION_START hook (AP-20)
+        if self._hook_registry is not None:
+            asyncio.create_task(
+                self._fire_session_hook(HookPoint.SESSION_START, session.id)
+            )
+
+        # Snapshot restore: re-queue pending_tool_calls, flush memory_cache (AP-19, D-17)
+        if self._snapshot_manager is not None:
+            asyncio.create_task(
+                self._restore_session_snapshot(session, session.id)
+            )
 
         return session
 
-    def set_emergency_stop(self, active: bool) -> None:
-        """Toggle emergency stop. When active, all messages are dropped."""
+    # -- Phase 44 hook + snapshot helpers ------------------------------------
+
+    async def _fire_session_hook(self, point: Any, session_key: str) -> None:
+        """Fire a SESSION_START or SESSION_END hook (AP-20)."""
+        if self._hook_registry is None:
+            return
+        try:
+            ctx = HookContext(hook_point=point, session_key=session_key)
+            await self._hook_registry.fire(point, ctx)
+        except Exception:
+            logger.warning("router.session_hook_failed", point=str(point), exc_info=True)
+
+    async def _restore_session_snapshot(self, session: Any, session_key: str) -> None:
+        """Restore snapshot state onto session (AP-19, D-17).
+
+        Re-queues pending_tool_calls onto session.pending_tool_calls so
+        AgentLoop picks them up at process() start. Flushes memory_cache
+        entries to memory store.
+        """
+        if self._snapshot_manager is None:
+            return
+        try:
+            snapshot = await self._snapshot_manager.restore(session_key)
+            if snapshot is None:
+                return
+
+            logger.info(
+                "session.snapshot_restored",
+                session_key=session_key,
+                pending_tool_calls=len(snapshot.pending_tool_calls),
+                memory_cache_entries=len(snapshot.memory_cache),
+            )
+
+            # Prepend restored messages so agent has prior context
+            if snapshot.messages:
+                session.messages = snapshot.messages + list(session.messages)
+
+            # Store pending_tool_calls on session for AgentLoop to pick up (D-17)
+            if snapshot.pending_tool_calls:
+                session.pending_tool_calls = snapshot.pending_tool_calls
+
+            # Flush memory_cache entries to memory store (D-17)
+            if snapshot.memory_cache and self._memory_store is not None:
+                for entry in snapshot.memory_cache:
+                    try:
+                        await self._memory_store.add(entry)
+                    except Exception as e:
+                        logger.warning(
+                            "session.memory_flush_failed",
+                            entry=str(entry)[:80],
+                            error=str(e),
+                        )
+
+            # Restore autonomy_override from Supabase (D-06, Phase 46.3)
+            if self._persistence is not None:
+                try:
+                    stored = await self._persistence.get_session(session.id)
+                    if stored and stored.get("autonomy_override"):
+                        from astridr.automation.autonomy import AutonomyLevel
+                        try:
+                            level = AutonomyLevel(stored["autonomy_override"])
+                            agent_session = self._get_or_create_agent_session(session)
+                            agent_session._autonomy_override = level
+                            logger.info(
+                                "autonomy_override.restored",
+                                session_id=session.id,
+                                level=level.value,
+                            )
+                        except (ValueError, KeyError):
+                            pass  # Invalid stored value, skip
+                except Exception:
+                    logger.warning(
+                        "session.autonomy_override_restore_failed",
+                        session_id=session.id,
+                        exc_info=True,
+                    )
+
+        except Exception:
+            logger.warning(
+                "session.snapshot_restore_failed",
+                session_key=session_key,
+                exc_info=True,
+            )
+
+    async def shutdown_snapshot_all(self) -> None:
+        """Capture snapshots for all active sessions on graceful shutdown (D-14).
+
+        Fires checkpoint_bg (fire-and-forget) for each active session.
+        Called from bootstrap shutdown handler.
+        """
+        if self._snapshot_manager is None:
+            return
+
+        active_sessions = list(self._sessions.values())
+        logger.info("router.shutdown_snapshot", session_count=len(active_sessions))
+
+        for session in active_sessions:
+            try:
+                messages = [
+                    {"role": m.get("role", "user"), "content": m.get("content", "")}
+                    if isinstance(m, dict) else
+                    {"role": getattr(m, "role", "user"), "content": getattr(m, "content", "") or ""}
+                    for m in session.messages
+                ]
+                self._snapshot_manager.checkpoint_bg(
+                    session_key=session.id,
+                    agent_type="unknown",
+                    messages=messages,
+                    pending_tool_calls=[],
+                    memory_cache=[],
+                )
+                # SESSION_END hook on shutdown
+                if self._hook_registry is not None:
+                    asyncio.create_task(
+                        self._fire_session_hook(HookPoint.SESSION_END, session.id)
+                    )
+            except Exception:
+                logger.warning(
+                    "router.shutdown_snapshot_failed",
+                    session_id=session.id,
+                    exc_info=True,
+                )
+
+    def set_emergency_stop(self, active: bool, reason: str = "manual", initiator: str = "system") -> None:
+        """Toggle emergency stop. When active, new messages are queued (global estop) or dropped (legacy).
+
+        If an EmergencyStop instance is wired in, delegates to it so all active agent
+        loops are cancelled and the audit log is written.  Also keeps the legacy bool
+        flag in sync for backward compatibility.
+        """
         self._emergency_stop = active
+        if self._estop:
+            if active:
+                asyncio.create_task(self._estop.activate(reason, initiator))
+            else:
+                asyncio.create_task(self._estop.deactivate(initiator))
         logger.warning("router.emergency_stop_toggled", active=active)
 
+    def register_channel(self, channel: BaseChannel) -> None:
+        """Register a plugin channel at runtime.
+
+        The channel must already have start() called before registering.
+        Raises ValueError if channel_id is already registered.
+
+        Per CHAN-03: registers without touching internal channel code.
+        """
+        cid = channel.channel_id
+        if cid in self._plugin_channels:
+            raise ValueError(
+                f"Channel '{cid}' is already registered. "
+                "Call deregister_channel() first."
+            )
+        self._plugin_channels[cid] = channel
+        logger.info("router.plugin_channel_registered", channel_id=cid)
+
+    def deregister_channel(self, channel_id: str) -> None:
+        """Remove a plugin channel from the runtime registry."""
+        removed = self._plugin_channels.pop(channel_id, None)
+        if removed is not None:
+            logger.info("router.plugin_channel_deregistered", channel_id=channel_id)
+
     @property
-    def sessions(self) -> dict[tuple[str, str], Session]:
-        """Read-only access to active sessions (for diagnostics)."""
+    def sessions(self) -> dict[Any, Session]:
+        """Read-only access to active sessions (for diagnostics).
+
+        Keys are composite strings (e.g. ``"larry::telegram::12345"``) when
+        a ``key_composer`` is configured, or ``(channel_id, chat_id)`` tuples
+        in legacy mode.
+        """
         return dict(self._sessions)
+
+    @property
+    def plugin_channels(self) -> dict[str, BaseChannel]:
+        """Read-only access to registered plugin channels (for diagnostics)."""
+        return dict(self._plugin_channels)
 
     # -- Internal -------------------------------------------------------------
 
@@ -594,8 +1001,53 @@ class MessageRouter:
             # Get or create an agent session for this router session
             agent_session = self._get_or_create_agent_session(session)
 
+            # HOOK-02: Plugin short-circuit before LLM (per D-04, D-05, D-06)
+            originating_plugin = self._plugin_channels.get(message.channel_id)
+            if originating_plugin is not None:
+                try:
+                    synthetic = await originating_plugin.before_agent_reply(message)
+                    if synthetic is not None:
+                        logger.info(
+                            "router.before_agent_reply_short_circuit",
+                            channel_id=originating_plugin.channel_id,
+                        )
+                        return synthetic
+                except Exception:
+                    logger.exception(
+                        "router.before_agent_reply_error",
+                        channel_id=message.channel_id,
+                    )
+                    # Fall through to LLM on hook error
+
+            # HOOK-01: Per-pipe tool allowlist enforcement (per D-01, D-02, D-03)
+            # Filter tool definitions BEFORE the LLM sees them (prompt-level filtering).
+            # Empty/missing pipe_tools = unrestricted (all profile tools available).
+            pipe_tools: list[str] = message.raw.get("pipe_tools", [])
+            _pipe_override_applied = False
+            if pipe_tools and message.raw.get("source") == "pipe":
+                allowed = set(pipe_tools)
+                filtered = [
+                    t for t in (self._all_tool_defs or [])
+                    if getattr(t, "name", None) in allowed
+                ]
+                agent_session._override_tools = filtered
+                _pipe_override_applied = True
+                logger.debug(
+                    "router.pipe_tool_allowlist_applied",
+                    pipe_name=message.raw.get("pipe_name"),
+                    allowed=pipe_tools,
+                    matched=len(filtered),
+                )
+
             user_msg = Message(role="user", content=text)
-            response_text = await self._agent_loop_instance.process(user_msg, agent_session)
+            agent_response = await self._agent_loop_instance.process(user_msg, agent_session)
+            response_text = str(agent_response)
+
+            # Clear pipe tool override to prevent bleed to subsequent messages
+            # on the same session (defensive — pipe sessions are typically fresh)
+            if _pipe_override_applied:
+                agent_session._override_tools = None
+
             return response_text
         except Exception:
             logger.exception("router.agent_loop_error")
@@ -619,6 +1071,54 @@ class MessageRouter:
             session_id=router_session.id,
         )
         return agent_session
+
+    async def _handle_tasks_command(self, message: IncomingMessage) -> OutgoingMessage:
+        """Handle /tasks command — show active agent work inline (ORCH-07).
+
+        Shows running flows, recent failures, and a summary count.
+        Works in any channel by querying FlowRegistry.
+        """
+        import datetime
+
+        if self._flow_registry is None:
+            return OutgoingMessage(
+                text="Task tracking not available (flow registry not initialized).",
+                chat_id=message.chat_id,
+            )
+
+        running = await self._flow_registry.list_flows(status="running", limit=20)
+        failed = await self._flow_registry.list_flows(status="failed", limit=5)
+
+        parts: list[str] = []
+
+        # Active tasks
+        if running:
+            parts.append(f"**Active Tasks ({len(running)})**")
+            for f in running:
+                started = datetime.datetime.fromtimestamp(f.started_at).strftime("%H:%M:%S")
+                task_snippet = f.task[:80] if len(f.task) <= 80 else f.task[:80]
+                parts.append(f"- `{f.agent_type_id}` — {task_snippet} (since {started})")
+        else:
+            parts.append("No active tasks.")
+
+        # Recent failures
+        if failed:
+            parts.append("")
+            parts.append(f"**Recent Failures ({len(failed)})**")
+            for f in failed:
+                err = f.error[:60] if f.error else "unknown"
+                parts.append(f"- `{f.agent_type_id}` — {err}")
+
+        # Summary line
+        total_running = len(running)
+        total_failed = len(failed)
+        parts.append("")
+        parts.append(f"_Flows: {total_running} active, {total_failed} recent failures_")
+
+        return OutgoingMessage(
+            text="\n".join(parts),
+            chat_id=message.chat_id,
+        )
 
     async def _handle_profile_command(
         self,
@@ -685,6 +1185,128 @@ class MessageRouter:
                 "  `/profile use <id>` — switch profile\n"
                 "  `/profile current` — show active profile"
             )
+
+    async def _handle_model_command(self, text: str, session: Session) -> str:
+        """Handle /model slash command (ROUTE-05, D-07, D-08).
+
+        Supported forms:
+          /model           -- show current model
+          /model <name>    -- set model for this session
+          /model reset     -- clear session override, return to routing rules
+        """
+        parts = text.split(maxsplit=1)
+        # Get the agent loop session to read/write _model_override
+        agent_session = self._get_or_create_agent_session(session)
+
+        if len(parts) == 1:
+            # Show current model
+            current = getattr(agent_session, "_model_override", None) or "auto (routing rules)"
+            return f"Current model: `{current}`"
+
+        model_name = parts[1].strip()
+
+        if model_name.lower() == "reset":
+            agent_session._model_override = None
+            # Also clear on ModelRouter if available
+            if self._model_router is not None:
+                self._model_router.clear_session_override(agent_session.id)
+            return "Model reset to auto (routing rules)."
+
+        # Set session override — takes effect next turn (D-07)
+        agent_session._model_override = model_name
+        # Also set on ModelRouter for routing resolution
+        if self._model_router is not None:
+            self._model_router.set_session_override(agent_session.id, model_name)
+        return f"Model set to `{model_name}` -- takes effect on your next message."
+
+    async def _handle_autonomy_command(self, text: str, session: Session) -> str:
+        """Handle /autonomy slash command (AP-09, D-05, D-06).
+
+        Supported forms:
+          /autonomy           -- show current override
+          /autonomy <level>   -- set override (silent|draft_approval|always_ask|blocked)
+          /autonomy reset     -- clear override, return to dynamic rules
+
+        Override persists to Supabase session_history per D-06.
+        """
+        import structlog
+        from astridr.automation.autonomy import AutonomyLevel
+
+        log = structlog.get_logger("router.autonomy_command")
+        parts = text.split(maxsplit=1)
+        agent_session = self._get_or_create_agent_session(session)
+
+        if len(parts) == 1:
+            current = getattr(agent_session, "_autonomy_override", None)
+            display = current.value if current else "none (dynamic rules apply)"
+            return f"Current autonomy override: `{display}`"
+
+        value = parts[1].strip().lower()
+
+        if value == "reset":
+            agent_session._autonomy_override = None
+            # Write-through to Supabase (D-06)
+            if self._persistence is not None:
+                self._persistence.update_session_autonomy_override_bg(
+                    session.id, None
+                )
+            log.info("autonomy_override.cleared", session_id=session.id)
+            return "Autonomy override cleared -- dynamic rules apply."
+
+        try:
+            level = AutonomyLevel(value)
+        except ValueError:
+            valid = ", ".join(lv.value for lv in AutonomyLevel)
+            return f"Unknown level `{value}`. Valid: {valid}"
+
+        agent_session._autonomy_override = level
+        # Write-through to Supabase (D-06)
+        if self._persistence is not None:
+            self._persistence.update_session_autonomy_override_bg(
+                session.id, level.value
+            )
+        log.info("autonomy_override.set", session_id=session.id, level=level.value)
+        return f"Autonomy override set to `{level.value}` for this session."
+
+    async def _handle_ingest_command(self, message: IncomingMessage) -> OutgoingMessage:
+        """Handle /ingest <url> -- scrape URL to markdown via FirecrawlTool (FIRE-01)."""
+        parts = message.text.strip().split(maxsplit=1)
+        if len(parts) < 2:
+            return OutgoingMessage(
+                text="Usage: /ingest <url>",
+                chat_id=message.chat_id,
+            )
+        url = parts[1].strip()
+
+        # Resolve FirecrawlTool from registry
+        if self._tool_registry is None:
+            return OutgoingMessage(
+                text="Tool registry not available -- cannot run /ingest.",
+                chat_id=message.chat_id,
+            )
+        tool = self._tool_registry.get("firecrawl_ingest")
+        if tool is None:
+            return OutgoingMessage(
+                text="FirecrawlTool is not registered. Check config.firecrawl.enabled.",
+                chat_id=message.chat_id,
+            )
+
+        result = await tool.execute(url=url)
+        if not result.success:
+            return OutgoingMessage(
+                text=f"Ingest failed: {result.error}",
+                chat_id=message.chat_id,
+            )
+
+        output = result.output or ""
+        # Truncate if very long (markdown can be large)
+        if len(output) > 4000:
+            output = output[:4000] + "\n\n... [truncated -- full content available in tool output]"
+
+        return OutgoingMessage(
+            text=output,
+            chat_id=message.chat_id,
+        )
 
     def _apply_profile_to_session(self, session: Session, agent_profile: Any) -> None:
         """Apply an AgentProfile to the agent session (prompt rebuild + tool filtering)."""
@@ -756,6 +1378,30 @@ class MessageRouter:
         except Exception:
             logger.exception("router.tts_error")
         return None
+
+    async def _send_tts_followup(
+        self,
+        channel: BaseChannel,
+        chat_id: str,
+        text: str,
+        persona_id: str | None,
+        reply_to_message_id: str | None,
+    ) -> None:
+        """Generate TTS and send as a follow-up message (non-blocking)."""
+        if not text or not text.strip():
+            return
+        try:
+            tts_attachment = await self._generate_tts(text, persona_id=persona_id)
+            if tts_attachment is not None:
+                followup = OutgoingMessage(
+                    text="\u200b",
+                    chat_id=chat_id,
+                    reply_to_message_id=reply_to_message_id,
+                    attachments=[tts_attachment],
+                )
+                await self._send_or_queue(channel, followup)
+        except Exception:
+            logger.exception("router.tts_followup_error")
 
     def _try_load_security_fallback(self) -> None:
         """Try to import and build the SecurityPipeline as a fallback.

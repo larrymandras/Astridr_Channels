@@ -8,6 +8,7 @@ Serves a minimal HTML chat interface at ``/``, accepts messages via
 from __future__ import annotations
 
 import asyncio
+import html
 import json
 import tempfile
 import time
@@ -16,7 +17,6 @@ from pathlib import Path
 from typing import Any
 
 import structlog
-import uvicorn
 from fastapi import FastAPI, Form, Request, UploadFile
 from fastapi.responses import FileResponse, HTMLResponse, JSONResponse, StreamingResponse
 
@@ -27,6 +27,7 @@ from astridr.channels.base import (
     OutgoingMessage,
 )
 from astridr.channels.briefing_dashboard import register_briefing_dashboard
+from astridr.channels.canvas import register_canvas_dashboard
 
 logger = structlog.get_logger()
 
@@ -42,7 +43,7 @@ class SSEManager:
 
     def subscribe(self, chat_id: str) -> asyncio.Queue[dict[str, Any]]:
         """Register a new SSE listener for a chat."""
-        queue: asyncio.Queue[dict[str, Any]] = asyncio.Queue()
+        queue: asyncio.Queue[dict[str, Any]] = asyncio.Queue(maxsize=500)
         if chat_id not in self._subscribers:
             self._subscribers[chat_id] = []
         self._subscribers[chat_id].append(queue)
@@ -66,7 +67,10 @@ class SSEManager:
             return
         payload = {"event": event, "data": data}
         for queue in self._subscribers[chat_id]:
-            await queue.put(payload)
+            try:
+                queue.put_nowait(payload)
+            except asyncio.QueueFull:
+                logger.warning("sse.queue_full_dropping", chat_id=chat_id)
         logger.debug("sse.published", chat_id=chat_id, event_type=event)
 
     async def publish_typing(self, chat_id: str) -> None:
@@ -302,11 +306,20 @@ class WebChannel(BaseChannel):
         self._on_message: MessageHandler | None = None
         self._sse_manager = SSEManager()
         self._running = False
+        self._whatsapp_channel: Any | None = None  # set by bootstrap (Phase 68)
+        self._whatsapp_webhook_key: str = ""        # set by bootstrap (Phase 68)
+
+    def set_whatsapp_channel(self, channel: Any, webhook_key: str) -> None:
+        """Wire WhatsApp channel for webhook route access (Phase 68)."""
+        self._whatsapp_channel = channel
+        self._whatsapp_webhook_key = webhook_key
 
     # ── Lifecycle ────────────────────────────────────────────────
 
     async def start(self, on_message: MessageHandler) -> None:
         """Create the FastAPI app, mount routes, and start uvicorn."""
+        import uvicorn
+
         self._on_message = on_message
         self._setup_app()
         self._running = True
@@ -458,6 +471,7 @@ class WebChannel(BaseChannel):
         self._add_security_middleware()
         # Dashboard routes must register BEFORE catch-all /{profile_path} routes
         register_briefing_dashboard(self._app)
+        register_canvas_dashboard(self._app)
         self._register_routes()
 
     def _add_security_middleware(self) -> None:
@@ -507,7 +521,7 @@ class WebChannel(BaseChannel):
             response.headers["Referrer-Policy"] = "no-referrer"
             response.headers["Content-Security-Policy"] = (
                 "default-src 'self'; "
-                "script-src 'self' 'unsafe-inline'; "
+                "script-src 'self' 'unsafe-inline' https://unpkg.com; "
                 "style-src 'self' 'unsafe-inline'; "
                 "connect-src 'self'; "
                 "img-src 'self' data: blob:; "
@@ -700,6 +714,44 @@ class WebChannel(BaseChannel):
                 ],
             })
 
+        # -- WhatsApp bridge webhook routes (Phase 68) -------------------------
+
+        @app.post("/internal/whatsapp/message")
+        async def whatsapp_webhook_message(request: Request) -> JSONResponse:
+            """Receive inbound WhatsApp message from bridge."""
+            if not self._whatsapp_channel:
+                return JSONResponse(status_code=503, content={"error": "WhatsApp not configured"})
+            body = await request.json()
+            webhook_key = request.headers.get("x-api-key", "")
+            accepted = await self._whatsapp_channel.on_webhook_message(body, webhook_key=webhook_key)
+            if not accepted:
+                return JSONResponse(status_code=401, content={"error": "Unauthorized"})
+            return JSONResponse(content={"ok": True})
+
+        @app.post("/internal/whatsapp/qr")
+        async def whatsapp_webhook_qr(request: Request) -> JSONResponse:
+            """Receive QR code data from bridge for pairing flow."""
+            if not self._whatsapp_channel:
+                return JSONResponse(status_code=503, content={"error": "WhatsApp not configured"})
+            webhook_key = request.headers.get("x-api-key", "")
+            if webhook_key != self._whatsapp_webhook_key:
+                return JSONResponse(status_code=401, content={"error": "Unauthorized"})
+            body = await request.json()
+            await self._whatsapp_channel.on_webhook_qr(body)
+            return JSONResponse(content={"ok": True})
+
+        @app.post("/internal/whatsapp/status")
+        async def whatsapp_webhook_status(request: Request) -> JSONResponse:
+            """Receive status events (ready/disconnected) from bridge."""
+            if not self._whatsapp_channel:
+                return JSONResponse(status_code=503, content={"error": "WhatsApp not configured"})
+            webhook_key = request.headers.get("x-api-key", "")
+            if webhook_key != self._whatsapp_webhook_key:
+                return JSONResponse(status_code=401, content={"error": "Unauthorized"})
+            body = await request.json()
+            await self._whatsapp_channel.on_webhook_status(body)
+            return JSONResponse(content={"ok": True})
+
         # ── Profile-scoped routes ────────────────────────────────
 
         @app.post("/{profile_path}/api/chat")
@@ -781,7 +833,7 @@ class WebChannel(BaseChannel):
                 f'"/{profile_path}/api/chat/" + chatId + "/stream"',
             ).replace(
                 "<h1>Astridr Chat</h1>",
-                f"<h1>Astridr Chat — {profile_path.title()}</h1>",
+                f"<h1>Astridr Chat — {html.escape(profile_path.title())}</h1>",
             ).replace(
                 '"/api/chat/voice"',
                 f'"/{profile_path}/api/chat/voice"',
