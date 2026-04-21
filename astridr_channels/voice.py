@@ -33,6 +33,11 @@ _BYTES_PER_SAMPLE = 2
 # Read audio in 512-sample chunks (~32 ms at 16 kHz)
 _CHUNK_SAMPLES = 512
 
+# Mic retry: back off 1s → 2s → 4s → … → 30s, give up after 5 consecutive failures
+_MIC_RETRY_MAX = 5
+_MIC_RETRY_BASE = 1.0
+_MIC_RETRY_CAP = 30.0
+
 
 class ConversationState(Enum):
     """State machine states for multi-turn conversation mode (D-10)."""
@@ -418,6 +423,8 @@ class VoiceChannel(BaseChannel):
         loop = asyncio.get_event_loop()
         device = self._input_device
 
+        consecutive_failures = 0
+
         while self._running:
             try:
                 raw = await loop.run_in_executor(
@@ -431,11 +438,30 @@ class VoiceChannel(BaseChannel):
                         device=device,
                     ).tobytes(),
                 )
+                consecutive_failures = 0
                 if self._detector.process_audio(raw):
                     return True  # Wake word detected
             except Exception as exc:
-                log.warning("voice.mic_read_error", error=str(exc))
-                await asyncio.sleep(1)
+                consecutive_failures += 1
+                delay = min(
+                    _MIC_RETRY_BASE * (2 ** (consecutive_failures - 1)),
+                    _MIC_RETRY_CAP,
+                )
+                if consecutive_failures >= _MIC_RETRY_MAX:
+                    log.error(
+                        "voice.mic_unavailable",
+                        error=str(exc),
+                        attempts=consecutive_failures,
+                    )
+                    self._running = False
+                    return False
+                log.warning(
+                    "voice.mic_read_error",
+                    error=str(exc),
+                    attempt=consecutive_failures,
+                    retry_in=delay,
+                )
+                await asyncio.sleep(delay)
         return False
 
     async def _record_until_silence(self) -> bytes:
