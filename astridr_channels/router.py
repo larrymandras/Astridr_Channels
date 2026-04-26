@@ -161,6 +161,10 @@ class MessageRouter:
         # Turn lock per chat_id — prevents heartbeat alert + user message interleaving (D-10)
         self._turn_locks: dict[str, asyncio.Lock] = {}
 
+        # Per-channel message counters for infrastructure telemetry
+        self._channel_msg_counts: dict[str, int] = {}
+        self._channel_last_latency_ms: dict[str, float] = {}
+
         # Phase 44 operations components — all optional
         self._hook_registry = hook_registry
         self._snapshot_manager = snapshot_manager
@@ -192,6 +196,18 @@ class MessageRouter:
     def set_model_router(self, router: Any) -> None:
         """Wire the ModelRouter for /model command session override management (ROUTE-05)."""
         self._model_router = router
+
+    def channel_stats(self) -> list[dict[str, Any]]:
+        """Return per-channel message count and last latency for infra telemetry."""
+        all_ids = set(self._channel_msg_counts) | set(self._channel_last_latency_ms)
+        return [
+            {
+                "channel": ch_id,
+                "messageCount": self._channel_msg_counts.get(ch_id, 0),
+                "lastLatencyMs": self._channel_last_latency_ms.get(ch_id),
+            }
+            for ch_id in sorted(all_ids)
+        ]
 
     def get_turn_lock(self, chat_id: str) -> asyncio.Lock:
         """Get or create the turn lock for a chat_id (D-10).
@@ -261,6 +277,8 @@ class MessageRouter:
 
     async def route(self, message: IncomingMessage, channel: BaseChannel) -> None:
         """Full routing pipeline for an incoming message."""
+        _ch_id = message.channel_id
+        self._channel_msg_counts[_ch_id] = self._channel_msg_counts.get(_ch_id, 0) + 1
 
         # 1. Emergency stop — queue (global estop) or drop (legacy bool)
         if self._estop and self._estop.is_active:
@@ -292,9 +310,11 @@ class MessageRouter:
             return
 
         lock = self.get_turn_lock(message.chat_id)
+        _t0 = time.monotonic()
         async with lock:
             # 2. Resolve profile
             await self._route_locked(message, channel)
+        self._channel_last_latency_ms[_ch_id] = round((time.monotonic() - _t0) * 1000, 1)
 
     async def _route_locked(self, message: IncomingMessage, channel: BaseChannel) -> None:
         """Execute routing pipeline steps 2-8 under the chat_id turn lock."""

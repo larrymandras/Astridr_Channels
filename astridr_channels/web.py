@@ -78,6 +78,42 @@ class SSEManager:
         await self.publish(chat_id, "typing", {"status": "typing"})
 
 
+# ── WhatsApp SSE Manager (CodePulse bridge) ─────────────────────────
+
+class WhatsAppSSEManager:
+    """Broadcast WhatsApp events (QR, status, bridge-status) to CodePulse SSE clients."""
+
+    def __init__(self) -> None:
+        self._subscribers: list[asyncio.Queue[dict[str, Any]]] = []
+        self._last_qr: str | None = None
+
+    def subscribe(self) -> asyncio.Queue[dict[str, Any]]:
+        queue: asyncio.Queue[dict[str, Any]] = asyncio.Queue(maxsize=100)
+        self._subscribers.append(queue)
+        if self._last_qr:
+            try:
+                queue.put_nowait({"event": "qr", "data": {"qr": self._last_qr}})
+            except asyncio.QueueFull:
+                pass
+        return queue
+
+    def unsubscribe(self, queue: asyncio.Queue[dict[str, Any]]) -> None:
+        try:
+            self._subscribers.remove(queue)
+        except ValueError:
+            pass
+
+    async def publish(self, event: str, data: dict[str, Any]) -> None:
+        if event == "qr":
+            self._last_qr = data.get("qr", "")
+        payload = {"event": event, "data": data}
+        for queue in self._subscribers:
+            try:
+                queue.put_nowait(payload)
+            except asyncio.QueueFull:
+                logger.warning("whatsapp_sse.queue_full_dropping")
+
+
 # ── HTML Chat Interface ──────────────────────────────────────────────
 
 CHAT_HTML = """<!DOCTYPE html>
@@ -305,6 +341,7 @@ class WebChannel(BaseChannel):
         self._server: Any = None
         self._on_message: MessageHandler | None = None
         self._sse_manager = SSEManager()
+        self._whatsapp_sse = WhatsAppSSEManager()
         self._running = False
         self._whatsapp_channel: Any | None = None  # set by bootstrap (Phase 68)
         self._whatsapp_webhook_key: str = ""        # set by bootstrap (Phase 68)
@@ -500,6 +537,8 @@ class WebChannel(BaseChannel):
 
         @app.middleware("http")
         async def rate_limit(request: Request, call_next: Any) -> Any:
+            if request.headers.get("upgrade", "").lower() == "websocket":
+                return await call_next(request)
             if request.url.path.startswith("/api/chat") and request.method == "POST":
                 client_ip = request.client.host if request.client else "unknown"
                 now = time.time()
@@ -514,9 +553,14 @@ class WebChannel(BaseChannel):
         if self._api_key:
             @app.middleware("http")
             async def auth_check(request: Request, call_next: Any) -> Any:
+                if request.headers.get("upgrade", "").lower() == "websocket":
+                    return await call_next(request)
                 if (
                     request.url.path.startswith("/api/")
                     and request.url.path != "/api/health"
+                    and not request.url.path.startswith("/api/whatsapp/")
+                    and not request.url.path.startswith("/api/audio/")
+                    and request.method != "OPTIONS"
                 ):
                     auth = request.headers.get("Authorization", "")
                     if auth != f"Bearer {self._api_key}":
@@ -527,6 +571,8 @@ class WebChannel(BaseChannel):
 
         @app.middleware("http")
         async def security_headers(request: Request, call_next: Any) -> Any:
+            if request.headers.get("upgrade", "").lower() == "websocket":
+                return await call_next(request)
             response = await call_next(request)
             response.headers["X-Content-Type-Options"] = "nosniff"
             response.headers["X-Frame-Options"] = "DENY"
@@ -751,6 +797,7 @@ class WebChannel(BaseChannel):
                 return JSONResponse(status_code=401, content={"error": "Unauthorized"})
             body = await request.json()
             await self._whatsapp_channel.on_webhook_qr(body)
+            await self._whatsapp_sse.publish("qr", {"qr": body.get("qr", "")})
             return JSONResponse(content={"ok": True})
 
         @app.post("/internal/whatsapp/status")
@@ -763,7 +810,86 @@ class WebChannel(BaseChannel):
                 return JSONResponse(status_code=401, content={"error": "Unauthorized"})
             body = await request.json()
             await self._whatsapp_channel.on_webhook_status(body)
+            status = body.get("status", "")
+            if status == "ready":
+                await self._whatsapp_sse.publish("status", {
+                    "status": "connected",
+                    "phone": body.get("number", ""),
+                })
+            elif status == "disconnected":
+                await self._whatsapp_sse.publish("status", {
+                    "status": "disconnected",
+                    "reason": body.get("reason", "unknown"),
+                })
             return JSONResponse(content={"ok": True})
+
+        # -- WhatsApp CodePulse routes (SSE + pairing proxy) ------
+
+        @app.get("/api/whatsapp/sse")
+        async def whatsapp_sse(request: Request) -> StreamingResponse:
+            """SSE stream for CodePulse WhatsApp dashboard."""
+            queue = self._whatsapp_sse.subscribe()
+
+            async def event_generator():
+                try:
+                    wch = self._whatsapp_channel
+                    bridge_online = wch is not None
+                    await self._whatsapp_sse.publish("bridge-status", {"online": bridge_online})
+                    if bridge_online:
+                        try:
+                            bridge_state = await wch.get_bridge_status()
+                            if bridge_state.get("state") == "ready":
+                                await self._whatsapp_sse.publish("status", {
+                                    "status": "connected",
+                                    "phone": bridge_state.get("number", ""),
+                                })
+                        except Exception:
+                            pass
+                    while True:
+                        if await request.is_disconnected():
+                            break
+                        try:
+                            msg = await asyncio.wait_for(queue.get(), timeout=30.0)
+                            if msg["event"] == "qr":
+                                yield f"event: qr\ndata: {msg['data'].get('qr', '')}\n\n"
+                            else:
+                                yield f"event: {msg['event']}\ndata: {json.dumps(msg['data'])}\n\n"
+                        except asyncio.TimeoutError:
+                            yield ": keepalive\n\n"
+                finally:
+                    self._whatsapp_sse.unsubscribe(queue)
+
+            return StreamingResponse(
+                event_generator(),
+                media_type="text/event-stream",
+                headers={
+                    "Cache-Control": "no-cache",
+                    "Connection": "keep-alive",
+                    "X-Accel-Buffering": "no",
+                },
+            )
+
+        @app.post("/api/whatsapp/start-pairing")
+        async def whatsapp_start_pairing() -> JSONResponse:
+            """Proxy pairing request to WhatsApp bridge."""
+            if not self._whatsapp_channel:
+                return JSONResponse(status_code=503, content={"error": "WhatsApp not configured"})
+            try:
+                await self._whatsapp_channel.request_pairing()
+                return JSONResponse(content={"ok": True})
+            except Exception as exc:
+                return JSONResponse(status_code=502, content={"error": str(exc)})
+
+        @app.post("/api/whatsapp/refresh-qr")
+        async def whatsapp_refresh_qr() -> JSONResponse:
+            """Re-trigger QR generation (same as start-pairing)."""
+            if not self._whatsapp_channel:
+                return JSONResponse(status_code=503, content={"error": "WhatsApp not configured"})
+            try:
+                await self._whatsapp_channel.request_pairing()
+                return JSONResponse(content={"ok": True})
+            except Exception as exc:
+                return JSONResponse(status_code=502, content={"error": str(exc)})
 
         # ── Profile-scoped routes ────────────────────────────────
 

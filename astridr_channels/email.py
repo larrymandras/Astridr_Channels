@@ -79,6 +79,8 @@ class EmailChannel(BaseChannel):
         self._on_message: MessageHandler | None = None
         self._running = False
         self._poll_task: asyncio.Task[None] | None = None
+        self._consecutive_errors = 0
+        self._max_errors_before_reconnect = 3
 
         # Track message-IDs for threading
         self._thread_map: dict[str, dict[str, str]] = {}
@@ -86,12 +88,16 @@ class EmailChannel(BaseChannel):
 
     # ── Lifecycle ────────────────────────────────────────────────
 
-    async def start(self, on_message: MessageHandler) -> None:
-        """Connect to IMAP and begin the polling / IDLE loop."""
+    async def _connect_imap(self) -> None:
+        """Create a fresh IMAP connection, replacing any existing one."""
         import aioimaplib
 
-        self._on_message = on_message
-        self._running = True
+        if self._imap_client is not None:
+            try:
+                await self._imap_client.logout()
+            except Exception:
+                pass
+            self._imap_client = None
 
         self._imap_client = aioimaplib.IMAP4_SSL(
             host=self._imap_host,
@@ -100,6 +106,14 @@ class EmailChannel(BaseChannel):
         await self._imap_client.wait_hello_from_server()
         await self._imap_client.login(self._username, self._password)
         await self._imap_client.select("INBOX")
+        self._consecutive_errors = 0
+
+    async def start(self, on_message: MessageHandler) -> None:
+        """Connect to IMAP and begin the polling / IDLE loop."""
+        self._on_message = on_message
+        self._running = True
+
+        await self._connect_imap()
 
         logger.info("email.started", host=self._imap_host, user=self._username)
 
@@ -160,10 +174,27 @@ class EmailChannel(BaseChannel):
                     await asyncio.sleep(self._poll_interval)
 
                 await self._fetch_new_messages()
+                self._consecutive_errors = 0
             except asyncio.CancelledError:
                 raise
             except Exception:
-                logger.exception("email.poll_error")
+                self._consecutive_errors += 1
+                logger.exception(
+                    "email.poll_error",
+                    consecutive_errors=self._consecutive_errors,
+                )
+                if self._consecutive_errors >= self._max_errors_before_reconnect:
+                    try:
+                        logger.warning("email.reconnecting", reason="consecutive_errors")
+                        await self._connect_imap()
+                        idle_supported = await self._try_idle_capability()
+                        logger.info("email.reconnected")
+                        continue
+                    except Exception:
+                        logger.exception("email.reconnect_failed")
+                        backoff = min(self._poll_interval * self._consecutive_errors, 300)
+                        await asyncio.sleep(backoff)
+                        continue
                 await asyncio.sleep(self._poll_interval)
 
     async def _try_idle_capability(self) -> bool:
